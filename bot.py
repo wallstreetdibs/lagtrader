@@ -3,14 +3,16 @@ import json
 import csv
 from datetime import datetime, timezone
 import math
+import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
 
-# File Paths
+# File Paths & API Credentials
 DATA_DIR = "data"
 PORTFOLIO_PATH = os.path.join(DATA_DIR, "portfolio_state.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.csv")
+TWELVE_DATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "e5412639c4844ff8b877be3f53b69c9d")
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -39,12 +41,10 @@ def load_portfolio_state():
         except Exception as e:
             print(f"[Warning] Failed to load existing portfolio state ({e}). Re-initializing.")
     
-    # Default State
-    state = {
+    return {
         "total_capital": 240000.0,
         "strategies": {name: {"allocated": 10000.0, "cash": 10000.0, "positions": []} for name in STRATEGY_NAMES}
     }
-    return state
 
 def save_portfolio_state(state):
     with open(PORTFOLIO_PATH, "w") as f:
@@ -63,26 +63,67 @@ def log_trade_history(trade_record):
 def get_broker_fee(ticker: str, trade_value: float) -> float:
     """Simulates IBKR tiered commission structure."""
     if "." in ticker and not ticker.endswith(".US"):
-        # Foreign / Cross-listed exchange minimum ($4.70-$4.75 base)
         return max(4.70, trade_value * 0.0008)
-    # US Equities ($0.35 min or $0.005/share)
     return max(0.35, trade_value * 0.0005)
 
 # -------------------------------------------------------------------
-# Helper Functions: Signal vs. Noise Filters
+# Helper Functions: Market Data (Primary yfinance + Fallback Twelve Data)
 # -------------------------------------------------------------------
 
+def get_market_data_twelvedata(ticker: str, interval: str = "5min", outputsize: int = 30) -> pd.DataFrame:
+    """Secondary market data fetcher using Twelve Data REST API."""
+    try:
+        # Convert YFinance ticker syntax to Twelve Data exchange notation
+        symbol = ticker
+        if ".AX" in ticker:
+            symbol = ticker.replace(".AX", ":ASX")
+        elif ".DE" in ticker:
+            symbol = ticker.replace(".DE", ":XETR")
+        elif ".TO" in ticker:
+            symbol = ticker.replace(".TO", ":TSX")
+        elif ".KS" in ticker:
+            symbol = ticker.replace(".KS", ":XKRX")
+        elif ".T" in ticker:
+            symbol = ticker.replace(".T", ":TSE")
+
+        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+
+        if "values" in data:
+            df = pd.DataFrame(data["values"])
+            df = df.iloc[::-1].reset_index(drop=True)  # Reverse to chronological order
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df.set_index("datetime", inplace=True)
+            for col in ["open", "high", "low", "close", "volume"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        else:
+            print(f"[TwelveData Warning] No values returned for {symbol}: {data.get('message', 'Unknown error')}")
+    except Exception as e:
+        print(f"[TwelveData Error] Failed for {ticker}: {e}")
+    return pd.DataFrame()
+
 def get_market_data(ticker: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
+    """Primary data loader with automatic fallback to Twelve Data."""
+    # 1. Attempt primary load via yfinance
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False)
-        if df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df.dropna()
+        if not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna()
+            if len(df) >= 5:
+                return df
     except Exception as e:
-        print(f"[Data Error] Failed to fetch {ticker}: {e}")
-        return pd.DataFrame()
+        print(f"[yfinance Warning] Primary fetch failed for {ticker}: {e}")
+
+    # 2. Fallback to Twelve Data
+    print(f"[Data Fallback] Fetching {ticker} via Twelve Data API...")
+    td_interval = "5min" if interval == "5m" else "1min"
+    return get_market_data_twelvedata(ticker, interval=td_interval)
 
 def calculate_zscore_and_rvol(df: pd.DataFrame, window: int = 20):
     """Calculates Z-Score of 5-minute return and Relative Volume (RVOL)."""
@@ -109,7 +150,6 @@ def is_earnings_event_today(ticker_symbol: str) -> bool:
         ticker = yf.Ticker(ticker_symbol)
         cal = ticker.calendar
         if cal is not None:
-            # Handle DataFrame/Dict formats from yfinance
             if isinstance(cal, pd.DataFrame) and not cal.empty:
                 event_date = pd.to_datetime(cal.iloc[0, 0]).date()
                 return event_date == datetime.now(timezone.utc).date()
@@ -160,7 +200,6 @@ def process_open_positions(state):
                 exit_fee = get_broker_fee(ticker, gross_proceeds)
                 net_pnl = gross_pnl - pos["entry_fee"] - exit_fee
                 
-                # Update Strategy Cash
                 strat_data["cash"] += (gross_proceeds - exit_fee)
                 
                 print(f"[{strat_name}] EXIT {ticker} ({reason}): Price ${current_price:.2f} | Net PnL: ${net_pnl:.2f}")
@@ -187,11 +226,6 @@ def process_open_positions(state):
 # -------------------------------------------------------------------
 
 def evaluate_strategy_signal(strat_name: str) -> dict:
-    """
-    Evaluates market conditions for a strategy and returns a trade setup ONLY 
-    if statistical signal criteria are satisfied.
-    """
-    # Mapping of target tickers and requirements
     target_map = {
         "ASX_ADR_Arbitrage": ("BHP.AX", "BHP"),
         "US_Earnings_Lag": ("NVDA", None),
@@ -224,7 +258,7 @@ def evaluate_strategy_signal(strat_name: str) -> dict:
         return None
 
     df = get_market_data(ticker)
-    if df.empty or len(df) < 25:
+    if df.empty or len(df) < 20:
         return None
 
     z_score, rvol = calculate_zscore_and_rvol(df)
@@ -233,25 +267,22 @@ def evaluate_strategy_signal(strat_name: str) -> dict:
     # --- NOISE FILTER 1: Earnings Verification ---
     if strat_name in ["US_Earnings_Lag", "FX_Adjusted_Earnings_Arb", "Biotech_News_Lag"]:
         if not is_earnings_event_today(ticker):
-            return None  # Filter noise: No confirmed earnings release today
+            return None
         if abs(z_score) < 2.5 or rvol < 2.0:
-            return None  # Filter noise: Post-earnings move lacked volume/volatility
+            return None
 
     # --- NOISE FILTER 2: SKHY Cluster Differentiation ---
     elif strat_name == "SKHY_ADR_FX_Neutralization":
-        # Requires extreme FX-adjusted spread anomaly vs Korean KOSPI close
         if abs(z_score) < 2.8 or rvol < 2.2:
             return None
     elif strat_name == "SKHY_HBM_Supply_Chain":
-        # Requires Micron/Semiconductor lead asset move confirmation
         lead_df = get_market_data(lead_ticker) if lead_ticker else pd.DataFrame()
         if lead_df.empty:
             return None
         lead_z, lead_rvol = calculate_zscore_and_rvol(lead_df)
         if lead_z < 2.5 or lead_rvol < 2.5:
-            return None  # Filter noise: Lead memory chip maker did not break out
+            return None
     elif strat_name == "SKHY_Post_Market_KOSPI":
-        # Requires ultra-high volatility shock near market session boundary
         if abs(z_score) < 3.0 or rvol < 2.5:
             return None
 
@@ -261,17 +292,14 @@ def evaluate_strategy_signal(strat_name: str) -> dict:
         if not lead_df.empty:
             lead_z, lead_rvol = calculate_zscore_and_rvol(lead_df)
             if abs(lead_z) < 2.2 or lead_rvol < 1.8:
-                return None  # Filter noise: Lead ticker did not move significantly
+                return None
 
     # --- NOISE FILTER 4: General Volatility & Volume Gate ---
     else:
         if abs(z_score) < 2.5 or rvol < 2.0:
-            return None  # Filter noise: Standard random walk fluctuation
+            return None
 
-    # If all statistical filters pass, construct trade proposal
     direction = "LONG" if z_score > 0 else "SHORT"
-    
-    # 1.5% TP / 0.8% SL targets
     tp_price = current_price * 1.015 if direction == "LONG" else current_price * 0.985
     sl_price = current_price * 0.992 if direction == "LONG" else current_price * 1.008
 
@@ -294,12 +322,11 @@ def run_trading_scan(state):
     now_str = datetime.now(timezone.utc).isoformat()
     
     for strat_name, strat_data in state["strategies"].items():
-        # Avoid opening new positions if already active
         if len(strat_data.get("positions", [])) > 0:
             continue
             
         cash = strat_data.get("cash", 0.0)
-        if cash < 2000.0:  # Minimum cash threshold
+        if cash < 2000.0:
             continue
 
         signal = evaluate_strategy_signal(strat_name)
@@ -310,7 +337,6 @@ def run_trading_scan(state):
         entry_price = signal["entry_price"]
         direction = signal["direction"]
         
-        # Risk Allocation: Deploy 90% of available strategy cash
         capital_to_deploy = cash * 0.90
         qty = math.floor(capital_to_deploy / entry_price)
         if qty <= 0:
@@ -320,7 +346,6 @@ def run_trading_scan(state):
         entry_fee = get_broker_fee(ticker, trade_value)
         total_cost = trade_value + entry_fee
 
-        # Deduct cash & log position
         strat_data["cash"] -= total_cost
         position = {
             "ticker": ticker,
@@ -355,17 +380,9 @@ def run_trading_scan(state):
 
 def main():
     print(f"=== LagTrader Engine Run Started: {datetime.now(timezone.utc).isoformat()} ===")
-    
-    # 1. Load Portfolio
     state = load_portfolio_state()
-    
-    # 2. Process Existing Position Exits
     process_open_positions(state)
-    
-    # 3. Scan & Filter New Signals
     run_trading_scan(state)
-    
-    # 4. Save State
     save_portfolio_state(state)
     print("=== Execution Run Complete. State Updated. ===")
 
