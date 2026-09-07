@@ -128,13 +128,16 @@ def format_trigger_time(signal_time_iso: str, action_time_iso: str = None) -> st
     return f"{seconds}s"
 
 # =====================================================================
-# Embedded Health-Check Server (For Keep-Alive Pings)
+# Embedded Health-Check Server (With CORS & Keep-Alive Support)
 # =====================================================================
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         response = {"status": "online", "system": "LagTrader Engine", "timestamp": datetime.now(timezone.utc).isoformat()}
         self.wfile.write(json.dumps(response).encode("utf-8"))
@@ -143,6 +146,15 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         """Handles HEAD requests sent by ping/monitoring services like UptimeRobot."""
         self.send_response(200)
         self.send_header("Content-type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        """Handles CORS preflight checks sent by web browsers."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
     def log_message(self, format, *args):
