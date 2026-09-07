@@ -25,7 +25,9 @@ PORTFOLIO_PATH = os.path.join(DATA_DIR, "portfolio_state.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.csv")
 GOOGLE_CREDENTIALS_PATH = "google_credentials.json"
 GOOGLE_SHEET_NAME = "LagTrader_Dashboard_Data"
-HTTP_PORT = 8080
+
+# Dynamically bind to host-provided PORT environment variable (e.g., Render) or fall back to 8080 locally
+HTTP_PORT = int(os.environ.get("PORT", 8080))
 
 STRATEGY_ROSTER = [
     "ASX_ADR_Arbitrage", "US_Earnings_Lag", "Inventory_Drift_Reversal",
@@ -397,7 +399,7 @@ class ExecutionEngine:
         self.gsheet_sync.sync(self.portfolio_mgr)
 
 # =====================================================================
-# Main Loop Run Simulation
+# Main Loop Execution (24/7 Service Runtime)
 # =====================================================================
 
 if __name__ == "__main__":
@@ -423,3 +425,8 @@ if __name__ == "__main__":
 
     engine.process_signal(test_signal)
     engine.process_pending_queues()
+
+    # Continuous background polling loop to keep service active on hosting platforms
+    while True:
+        time.sleep(60)
+        engine.process_pending_queues()
