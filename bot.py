@@ -139,6 +139,12 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         response = {"status": "online", "system": "LagTrader Engine", "timestamp": datetime.now(timezone.utc).isoformat()}
         self.wfile.write(json.dumps(response).encode("utf-8"))
 
+    def do_HEAD(self):
+        """Handles HEAD requests sent by ping/monitoring services like UptimeRobot."""
+        self.send_response(200)
+        self.send_header("Content-type", "application/json")
+        self.end_headers()
+
     def log_message(self, format, *args):
         return  # Suppress HTTP server stdout logs
 
