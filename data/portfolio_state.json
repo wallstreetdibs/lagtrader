@@ -1,0 +1,290 @@
+{
+  "total_capital": 240000.0,
+  "strategies": {
+    "ASX_ADR_Arbitrage": {
+      "allocated": 10000.0,
+      "cash": 555.7802042007443,
+      "positions": [
+        {
+          "ticker": "BHP.AX",
+          "direction": "LONG",
+          "entry_price": 62.93000030517578,
+          "qty": 150,
+          "tp_price": 63.87395030975341,
+          "sl_price": 62.458025302886966,
+          "entry_fee": 4.719750022888184,
+          "entry_time": "2026-09-07T20:07:32.465892+00:00"
+        }
+      ]
+    },
+    "US_Earnings_Lag": {
+      "allocated": 10000.0,
+      "cash": 10000.0,
+      "positions": []
+    },
+    "Inventory_Drift_Reversal": {
+      "allocated": 10000.0,
+      "cash": 496.75074999999924,
+      "positions": [
+        {
+          "ticker": "IFX.DE",
+          "direction": "LONG",
+          "entry_price": 60.5,
+          "qty": 157,
+          "tp_price": 61.71,
+          "sl_price": 60.016,
+          "entry_fee": 4.74925,
+          "entry_time": "2026-09-07T20:07:33.107997+00:00"
+        }
+      ]
+    },
+    "Futures_Lead_Front_Run": {
+      "allocated": 10000.0,
+      "cash": 10000.0,
+      "positions": []
+    },
+    "Crypto_FinTech_Echo": {
+      "allocated": 10000.0,
+      "cash": 508.0566702156066,
+      "positions": [
+        {
+          "ticker": "ADE.DE",
+          "direction": "LONG",
+          "entry_price": 26.799999237060547,
+          "qty": 354,
+          "tp_price": 28.40799919128418,
+          "sl_price": 26.263999252319337,
+          "entry_fee": 4.743599864959717,
+          "entry_time": "2026-09-07T20:07:33.969842+00:00"
+        }
+      ]
+    },
+    "Sentiment_Echo": {
+      "allocated": 10000.0,
+      "cash": 727.9158963928221,
+      "positions": [
+        {
+          "ticker": "NOVO-B.CO",
+          "direction": "LONG",
+          "entry_price": 298.95001220703125,
+          "qty": 31,
+          "tp_price": 303.43426239013667,
+          "sl_price": 295.96051208496095,
+          "entry_fee": 4.633725189208985,
+          "entry_time": "2026-09-07T20:07:34.276307+00:00"
+        }
+      ]
+    },
+    "Immediate_Index_Proxy": {
+      "allocated": 10000.0,
+      "cash": 10000.0,
+      "positions": []
+    },
+    "Nikkei_ADR_Front_Run": {
+      "allocated": 10000.0,
+      "cash": 10000.0,
+      "positions": []
+    },
+    "WTI_Crude_Lag": {
+      "allocated": 10000.0,
+      "cash": 10000.0,
+      "positions": []
+    },
+    "Gold_Futures_Echo": {
+      "allocated": 10000.0,
+      "cash": 10000.0,
+      "positions": []
+    },
+    "Biotech_News_Lag": {
+      "allocated": 10000.0,
+      "cash": 559.7649444580074,
+      "positions": [
+        {
+          "ticker": "BNTX",
+          "direction": "LONG",
+          "entry_price": 103.73500061035156,
+          "qty": 91,
+          "tp_price": 108.40307563781738,
+          "sl_price": 102.17897560119629,
+          "entry_fee": 0.35,
+          "entry_time": "2026-09-07T20:07:35.930012+00:00"
+        }
+      ]
+    },
+    "Cross_Listed_Pair_Fade": {
+      "allocated": 10000.0,
+      "cash": 495.4502276654239,
+      "positions": [
+        {
+          "ticker": "RIO.TO",
+          "direction": "LONG",
+          "entry_price": 3.549999952316284,
+          "qty": 2676,
+          "tp_price": 3.5925999517440794,
+          "sl_price": 3.5286999526023863,
+          "entry_fee": 4.7498999361991885,
+          "entry_time": "2026-09-07T20:07:36.178909+00:00"
+        }
+      ]
+    },
+    "Time_Zone_Momentum_Relay": {
+      "allocated": 10000.0,
+      "cash": 541.8730313110354,
+      "positions": [
+        {
+          "ticker": "1306.T",
+          "direction": "LONG",
+          "entry_price": 429.70001220703125,
+          "qty": 22,
+          "tp_price": 435.7158123779297,
+          "sl_price": 426.69211212158206,
+          "entry_fee": 4.726700134277344,
+          "entry_time": "2026-09-07T20:07:36.390100+00:00"
+        }
+      ]
+    },
+    "FX_Adjusted_Earnings_Arb": {
+      "allocated": 10000.0,
+      "cash": 571.3300537109371,
+      "positions": [
+        {
+          "ticker": "WMT",
+          "direction": "LONG",
+          "entry_price": 107.13999938964844,
+          "qty": 88,
+          "tp_price": 109.81849937438965,
+          "sl_price": 106.06859939575195,
+          "entry_fee": 0.35,
+          "entry_time": "2026-09-07T20:07:36.725734+00:00"
+        }
+      ]
+    },
+    "Commodity_Proxy_Lag": {
+      "allocated": 10000.0,
+      "cash": 10000.0,
+      "positions": []
+    },
+    "ETF_NAV_Window_Arb": {
+      "allocated": 10000.0,
+      "cash": 10000.0,
+      "positions": []
+    },
+    "Nikkei_Tech_Relay": {
+      "allocated": 10000.0,
+      "cash": 651.8700317382809,
+      "positions": [
+        {
+          "ticker": "QQQ",
+          "direction": "LONG",
+          "entry_price": 719.0599975585938,
+          "qty": 13,
+          "tp_price": 727.6887175292969,
+          "sl_price": 714.7456375732422,
+          "entry_fee": 0.35,
+          "entry_time": "2026-09-07T20:07:37.336399+00:00"
+        }
+      ]
+    },
+    "London_Metals_Catchup": {
+      "allocated": 10000.0,
+      "cash": 547.8947619628907,
+      "positions": [
+        {
+          "ticker": "FCX",
+          "direction": "LONG",
+          "entry_price": 72.70500183105469,
+          "qty": 130,
+          "tp_price": 73.72287185668945,
+          "sl_price": 72.1960668182373,
+          "entry_fee": 0.455,
+          "entry_time": "2026-09-07T20:07:37.617500+00:00"
+        }
+      ]
+    },
+    "Treasury_Shockwave": {
+      "allocated": 10000.0,
+      "cash": 10000.0,
+      "positions": []
+    },
+    "Canadian_Energy_Echo": {
+      "allocated": 10000.0,
+      "cash": 587.145770809173,
+      "positions": [
+        {
+          "ticker": "SU.TO",
+          "direction": "LONG",
+          "entry_price": 93.1500015258789,
+          "qty": 101,
+          "tp_price": 94.82670155334473,
+          "sl_price": 92.311651512146,
+          "entry_fee": 4.704075077056885,
+          "entry_time": "2026-09-07T20:07:38.258176+00:00"
+        }
+      ]
+    },
+    "ETF_Creation_Lag": {
+      "allocated": 10000.0,
+      "cash": 506.895536960601,
+      "positions": [
+        {
+          "ticker": "VVSM.DE",
+          "direction": "LONG",
+          "entry_price": 92.12000274658203,
+          "qty": 103,
+          "tp_price": 92.8109027671814,
+          "sl_price": 91.65940273284912,
+          "entry_fee": 4.744180141448974,
+          "entry_time": "2026-09-07T20:07:38.484427+00:00"
+        }
+      ]
+    },
+    "SKHY_ADR_FX_Neutralization": {
+      "allocated": 10000.0,
+      "cash": 619.4449676513668,
+      "positions": [
+        {
+          "ticker": "SKHY",
+          "direction": "LONG",
+          "entry_price": 176.98500061035156,
+          "qty": 53,
+          "tp_price": 181.40962562561035,
+          "sl_price": 175.21515060424804,
+          "entry_fee": 0.35,
+          "entry_time": "2026-09-07T20:07:38.762138+00:00"
+        }
+      ]
+    },
+    "SKHY_HBM_Supply_Chain": {
+      "allocated": 10000.0,
+      "cash": 619.4449676513668,
+      "positions": [
+        {
+          "ticker": "SKHY",
+          "direction": "LONG",
+          "entry_price": 176.98500061035156,
+          "qty": 53,
+          "tp_price": 182.2945506286621,
+          "sl_price": 174.86118060302735,
+          "entry_fee": 0.35,
+          "entry_time": "2026-09-07T20:07:38.981805+00:00"
+        }
+      ]
+    },
+    "SKHY_Post_Market_KOSPI": {
+      "allocated": 10000.0,
+      "cash": 619.4449676513668,
+      "positions": [
+        {
+          "ticker": "SKHY",
+          "direction": "LONG",
+          "entry_price": 176.98500061035156,
+          "qty": 53,
+          "tp_price": 183.17947563171384,
+          "sl_price": 174.33022560119628,
+          "entry_fee": 0.35,
+          "entry_time": "2026-09-07T20:07:39.089867+00:00"
+        }
+      ]
+    }
+  }
+}
