@@ -2,190 +2,372 @@ import os
 import json
 import csv
 from datetime import datetime, timezone
-import pandas as pd
+import math
 import yfinance as yf
+import pandas as pd
+import numpy as np
 
-# Paths for persisting state inside the GitHub repository
+# File Paths
 DATA_DIR = "data"
-STATE_FILE = os.path.join(DATA_DIR, "portfolio_state.json")
-HISTORY_FILE = os.path.join(DATA_DIR, "trade_history.csv")
+PORTFOLIO_PATH = os.path.join(DATA_DIR, "portfolio_state.json")
+HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.csv")
 
-# 24 Strategy Definitions ($10,000 virtual capital each)
-STRATEGIES_CONFIG = {
-    "ASX_ADR_Arbitrage": {"watch": "BHP", "trade": "BHP.AX", "sl_pct": 0.0075, "tp_pct": 0.015, "asset_type": "INTL_EQUITY"},
-    "US_Earnings_Lag": {"watch": "NVDA", "trade": "ASML.AS", "sl_pct": 0.015, "tp_pct": 0.045, "asset_type": "INTL_EQUITY"},
-    "Inventory_Drift_Reversal": {"watch": "QQQ", "trade": "IFX.DE", "sl_pct": 0.008, "tp_pct": 0.020, "asset_type": "INTL_EQUITY"},
-    "Futures_Lead_Front_Run": {"watch": "MNQ=F", "trade": "FDAX.DE", "sl_pct": 0.005, "tp_pct": 0.010, "asset_type": "FUTURES"},
-    "Crypto_FinTech_Echo": {"watch": "MSTR", "trade": "ADE.DE", "sl_pct": 0.020, "tp_pct": 0.060, "asset_type": "INTL_EQUITY"},
-    "Sentiment_Echo": {"watch": "LLY", "trade": "NOVO-B.CO", "sl_pct": 0.010, "tp_pct": 0.015, "asset_type": "INTL_EQUITY"},
-    "Immediate_Index_Proxy": {"watch": "SPY", "trade": "CSPX.L", "sl_pct": 0.005, "tp_pct": 0.005, "asset_type": "INTL_EQUITY"},
-    "Nikkei_ADR_Front_Run": {"watch": "TSLA", "trade": "7203.T", "sl_pct": 0.010, "tp_pct": 0.020, "asset_type": "INTL_EQUITY"},
-    "WTI_Crude_Lag": {"watch": "CL=F", "trade": "BP.L", "sl_pct": 0.012, "tp_pct": 0.030, "asset_type": "INTL_EQUITY"},
-    "Gold_Futures_Echo": {"watch": "GC=F", "trade": "GOL.PA", "sl_pct": 0.008, "tp_pct": 0.016, "asset_type": "INTL_EQUITY"},
-    "Biotech_News_Lag": {"watch": "MRNA", "trade": "BNTX", "sl_pct": 0.015, "tp_pct": 0.045, "asset_type": "US_EQUITY"},
-    "Cross_Listed_Pair_Fade": {"watch": "RIO", "trade": "RIO.TO", "sl_pct": 0.006, "tp_pct": 0.012, "asset_type": "INTL_EQUITY"},
-    "Time_Zone_Momentum_Relay": {"watch": "SPY", "trade": "1306.T", "sl_pct": 0.007, "tp_pct": 0.014, "asset_type": "INTL_EQUITY"},
-    "FX_Adjusted_Earnings_Arb": {"watch": "TGT", "trade": "WMT", "sl_pct": 0.010, "tp_pct": 0.025, "asset_type": "US_EQUITY"},
-    "Commodity_Proxy_Lag": {"watch": "CL=F", "trade": "SU.TO", "sl_pct": 0.012, "tp_pct": 0.036, "asset_type": "INTL_EQUITY"},
-    "ETF_NAV_Window_Arb": {"watch": "SPY", "trade": "CSPX.L", "sl_pct": 0.004, "tp_pct": 0.006, "asset_type": "INTL_EQUITY"},
-    "Nikkei_Tech_Relay": {"watch": "9984.T", "trade": "QQQ", "sl_pct": 0.006, "tp_pct": 0.012, "asset_type": "US_EQUITY"},
-    "London_Metals_Catchup": {"watch": "RIO.L", "trade": "FCX", "sl_pct": 0.007, "tp_pct": 0.014, "asset_type": "US_EQUITY"},
-    "Treasury_Shockwave": {"watch": "ZN=F", "trade": "NK225M.OS", "sl_pct": 0.008, "tp_pct": 0.020, "asset_type": "FUTURES"},
-    "Canadian_Energy_Echo": {"watch": "XOM", "trade": "SU.TO", "sl_pct": 0.009, "tp_pct": 0.018, "asset_type": "INTL_EQUITY"},
-    "ETF_Creation_Lag": {"watch": "SMH", "trade": "VVSM.DE", "sl_pct": 0.005, "tp_pct": 0.0075, "asset_type": "INTL_EQUITY"},
-    "SKHY_ADR_FX_Neutralization": {"watch": "000660.KS", "trade": "SKHY", "sl_pct": 0.010, "tp_pct": 0.025, "asset_type": "US_EQUITY"},
-    "SKHY_HBM_Supply_Chain": {"watch": "MU", "trade": "SKHY", "sl_pct": 0.012, "tp_pct": 0.030, "asset_type": "US_EQUITY"},
-    "SKHY_Post_Market_KOSPI": {"watch": "NVDA", "trade": "SKHY", "sl_pct": 0.015, "tp_pct": 0.035, "asset_type": "US_EQUITY"}
-}
+# Ensure data directory exists
+os.makedirs(DATA_DIR, exist_ok=True)
 
-def calculate_ibkr_fee(asset_type: str, qty: float, price: float) -> float:
-    """Calculates estimated IBKR Pro commission fees per order."""
-    trade_value = qty * price
-    if asset_type == "US_EQUITY":
-        # Tiered: $0.0035 per share (Min $0.35, Max 1% of trade value)
-        fee = max(0.35, qty * 0.0035)
-        return min(fee, trade_value * 0.01)
-    elif asset_type == "FUTURES":
-        # Fixed contract fee estimate (~$0.85 / contract)
-        return max(0.85, qty * 0.85)
-    else:  # INTL_EQUITY
-        # Approx 0.05% of trade value with $2.50 minimum
-        return max(2.50, trade_value * 0.0005)
+# Complete Strategy Roster (24 Strategies)
+STRATEGY_NAMES = [
+    "ASX_ADR_Arbitrage", "US_Earnings_Lag", "Inventory_Drift_Reversal",
+    "Futures_Lead_Front_Run", "Crypto_FinTech_Echo", "Sentiment_Echo",
+    "Immediate_Index_Proxy", "Nikkei_ADR_Front_Run", "WTI_Crude_Lag",
+    "Gold_Futures_Echo", "Biotech_News_Lag", "Cross_Listed_Pair_Fade",
+    "Time_Zone_Momentum_Relay", "FX_Adjusted_Earnings_Arb", "Commodity_Proxy_Lag",
+    "ETF_NAV_Window_Arb", "Nikkei_Tech_Relay", "London_Metals_Catchup",
+    "Treasury_Shockwave", "Canadian_Energy_Echo", "ETF_Creation_Lag",
+    "SKHY_ADR_FX_Neutralization", "SKHY_HBM_Supply_Chain", "SKHY_Post_Market_KOSPI"
+]
 
-def initialize_or_load_state():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(STATE_FILE):
-        state = {"total_capital": 240000.0, "strategies": {}}
-        for strat_name in STRATEGIES_CONFIG:
-            state["strategies"][strat_name] = {
-                "allocated": 10000.0,
-                "cash": 10000.0,
-                "positions": []
-            }
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-        return state
-    else:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
+# -------------------------------------------------------------------
+# Helper Functions: State Management & Fees
+# -------------------------------------------------------------------
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
+def load_portfolio_state():
+    if os.path.exists(PORTFOLIO_PATH):
+        try:
+            with open(PORTFOLIO_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[Warning] Failed to load existing portfolio state ({e}). Re-initializing.")
+    
+    # Default State
+    state = {
+        "total_capital": 240000.0,
+        "strategies": {name: {"allocated": 10000.0, "cash": 10000.0, "positions": []} for name in STRATEGY_NAMES}
+    }
+    return state
+
+def save_portfolio_state(state):
+    with open(PORTFOLIO_PATH, "w") as f:
         json.dump(state, f, indent=2)
 
-def log_trade(strat_name, ticker, direction, entry_p, exit_p, qty, pnl, fee, reason):
-    file_exists = os.path.exists(HISTORY_FILE)
-    with open(HISTORY_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
+def log_trade_history(trade_record):
+    file_exists = os.path.exists(HISTORY_PATH)
+    headers = ["timestamp", "strategy", "ticker", "action", "qty", "price", "gross_pnl", "fee", "net_pnl", "reason"]
+    
+    with open(HISTORY_PATH, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
         if not file_exists:
-            writer.writerow(["timestamp", "strategy", "ticker", "direction", "qty", "entry_price", "exit_price", "gross_pnl", "ibkr_fee", "net_pnl", "exit_reason"])
-        net_pnl = pnl - fee
-        writer.writerow([
-            datetime.now(timezone.utc).isoformat(), strat_name, ticker, direction,
-            qty, round(entry_p, 4), round(exit_p, 4), round(pnl, 2), round(fee, 2), round(net_pnl, 2), reason
-        ])
+            writer.writeheader()
+        writer.writerow(trade_record)
 
-def fetch_latest_price(ticker):
+def get_broker_fee(ticker: str, trade_value: float) -> float:
+    """Simulates IBKR tiered commission structure."""
+    if "." in ticker and not ticker.endswith(".US"):
+        # Foreign / Cross-listed exchange minimum ($4.70-$4.75 base)
+        return max(4.70, trade_value * 0.0008)
+    # US Equities ($0.35 min or $0.005/share)
+    return max(0.35, trade_value * 0.0005)
+
+# -------------------------------------------------------------------
+# Helper Functions: Signal vs. Noise Filters
+# -------------------------------------------------------------------
+
+def get_market_data(ticker: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
     try:
-        data = yf.download(ticker, period="1d", interval="1m", progress=False)
-        if not data.empty:
-            close_val = data["Close"].iloc[-1]
-            return float(close_val.iloc[0]) if isinstance(close_val, pd.Series) else float(close_val)
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df.dropna()
     except Exception as e:
-        print(f"Error fetching {ticker}: {e}")
-    return None
+        print(f"[Data Error] Failed to fetch {ticker}: {e}")
+        return pd.DataFrame()
 
-def process_engine():
-    state = initialize_or_load_state()
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{now_str}] Starting NostraTrade 24-Strategy Execution...")
+def calculate_zscore_and_rvol(df: pd.DataFrame, window: int = 20):
+    """Calculates Z-Score of 5-minute return and Relative Volume (RVOL)."""
+    if len(df) < window + 1:
+        return 0.0, 0.0
+    
+    returns = df["Close"].pct_change()
+    mean_ret = returns.rolling(window).mean()
+    std_ret = returns.rolling(window).std()
+    
+    latest_ret = returns.iloc[-1]
+    last_std = std_ret.iloc[-1]
+    
+    z_score = (latest_ret - mean_ret.iloc[-1]) / last_std if last_std > 0 else 0.0
+    
+    vol_sma = df["Volume"].rolling(window).mean().iloc[-1]
+    rvol = df["Volume"].iloc[-1] / vol_sma if vol_sma > 0 else 0.0
+    
+    return float(z_score), float(rvol)
 
-    # Phase 1: Process Open Positions for TP / SL Exits
+def is_earnings_event_today(ticker_symbol: str) -> bool:
+    """Verifies whether today is an actual earnings report date for the symbol."""
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        cal = ticker.calendar
+        if cal is not None:
+            # Handle DataFrame/Dict formats from yfinance
+            if isinstance(cal, pd.DataFrame) and not cal.empty:
+                event_date = pd.to_datetime(cal.iloc[0, 0]).date()
+                return event_date == datetime.now(timezone.utc).date()
+            elif isinstance(cal, dict) and "Earnings Date" in cal:
+                dates = cal["Earnings Date"]
+                if dates:
+                    event_date = pd.to_datetime(dates[0]).date()
+                    return event_date == datetime.now(timezone.utc).date()
+    except Exception:
+        pass
+    return False
+
+# -------------------------------------------------------------------
+# Engine Step 1: Manage & Exit Open Positions
+# -------------------------------------------------------------------
+
+def process_open_positions(state):
+    print("\n--- Checking Open Positions for Exits (TP/SL) ---")
+    now_str = datetime.now(timezone.utc).isoformat()
+    
     for strat_name, strat_data in state["strategies"].items():
-        cfg = STRATEGIES_CONFIG[strat_name]
-        active_positions = strat_data["positions"]
-        remaining_positions = []
-
-        for pos in active_positions:
+        positions = strat_data.get("positions", [])
+        updated_positions = []
+        
+        for pos in positions:
             ticker = pos["ticker"]
-            current_price = fetch_latest_price(ticker)
-            if not current_price:
-                remaining_positions.append(pos)
+            df = get_market_data(ticker, period="1d", interval="1m")
+            if df.empty:
+                updated_positions.append(pos)
                 continue
-
-            entry_price = pos["entry_price"]
+            
+            current_price = float(df["Close"].iloc[-1])
             qty = pos["qty"]
+            entry_price = pos["entry_price"]
             tp_price = pos["tp_price"]
             sl_price = pos["sl_price"]
             direction = pos["direction"]
-
-            # Exit Conditions
-            hit_tp = (direction == "LONG" and current_price >= tp_price) or (direction == "SHORT" and current_price <= tp_price)
-            hit_sl = (direction == "LONG" and current_price <= sl_price) or (direction == "SHORT" and current_price >= sl_price)
-
+            
+            hit_tp = (direction == "LONG" and current_price >= tp_price)
+            hit_sl = (direction == "LONG" and current_price <= sl_price)
+            
             if hit_tp or hit_sl:
                 reason = "TAKE_PROFIT" if hit_tp else "STOP_LOSS"
-                gross_pnl = (current_price - entry_price) * qty if direction == "LONG" else (entry_price - current_price) * qty
-                exit_fee = calculate_ibkr_fee(cfg["asset_type"], qty, current_price)
-                total_fees = pos["entry_fee"] + exit_fee
-                net_pnl = gross_pnl - total_fees
-
-                strat_data["cash"] += (qty * current_price) + net_pnl
-                log_trade(strat_name, ticker, direction, entry_price, current_price, qty, gross_pnl, total_fees, reason)
-                print(f"[{strat_name}] CLOSED {direction} on {ticker} via {reason}. Net P&L: ${net_pnl:.2f}")
+                gross_proceeds = current_price * qty
+                cost_basis = entry_price * qty
+                gross_pnl = gross_proceeds - cost_basis
+                
+                exit_fee = get_broker_fee(ticker, gross_proceeds)
+                net_pnl = gross_pnl - pos["entry_fee"] - exit_fee
+                
+                # Update Strategy Cash
+                strat_data["cash"] += (gross_proceeds - exit_fee)
+                
+                print(f"[{strat_name}] EXIT {ticker} ({reason}): Price ${current_price:.2f} | Net PnL: ${net_pnl:.2f}")
+                
+                log_trade_history({
+                    "timestamp": now_str,
+                    "strategy": strat_name,
+                    "ticker": ticker,
+                    "action": "SELL",
+                    "qty": qty,
+                    "price": current_price,
+                    "gross_pnl": round(gross_pnl, 2),
+                    "fee": round(exit_fee, 2),
+                    "net_pnl": round(net_pnl, 2),
+                    "reason": reason
+                })
             else:
-                remaining_positions.append(pos)
+                updated_positions.append(pos)
+                
+        strat_data["positions"] = updated_positions
 
-        strat_data["positions"] = remaining_positions
+# -------------------------------------------------------------------
+# Engine Step 2: Signal Generation & Noise Auditing
+# -------------------------------------------------------------------
 
-    # Phase 2: Check Signals & Trigger New Trades
+def evaluate_strategy_signal(strat_name: str) -> dict:
+    """
+    Evaluates market conditions for a strategy and returns a trade setup ONLY 
+    if statistical signal criteria are satisfied.
+    """
+    # Mapping of target tickers and requirements
+    target_map = {
+        "ASX_ADR_Arbitrage": ("BHP.AX", "BHP"),
+        "US_Earnings_Lag": ("NVDA", None),
+        "Inventory_Drift_Reversal": ("IFX.DE", None),
+        "Futures_Lead_Front_Run": ("SPY", "ES=F"),
+        "Crypto_FinTech_Echo": ("ADE.DE", "BTC-USD"),
+        "Sentiment_Echo": ("NOVO-B.CO", None),
+        "Immediate_Index_Proxy": ("SPY", None),
+        "Nikkei_ADR_Front_Run": ("TM", "7203.T"),
+        "WTI_Crude_Lag": ("XOM", "USO"),
+        "Gold_Futures_Echo": ("NEM", "GLD"),
+        "Biotech_News_Lag": ("BNTX", None),
+        "Cross_Listed_Pair_Fade": ("RIO.TO", "RIO"),
+        "Time_Zone_Momentum_Relay": ("1306.T", None),
+        "FX_Adjusted_Earnings_Arb": ("WMT", None),
+        "Commodity_Proxy_Lag": ("VALE", "PICK"),
+        "ETF_NAV_Window_Arb": ("EEM", None),
+        "Nikkei_Tech_Relay": ("QQQ", "^N225"),
+        "London_Metals_Catchup": ("FCX", "COPX"),
+        "Treasury_Shockwave": ("TLT", "^TNX"),
+        "Canadian_Energy_Echo": ("SU.TO", "USO"),
+        "ETF_Creation_Lag": ("VVSM.DE", None),
+        "SKHY_ADR_FX_Neutralization": ("SKHY", "000660.KS"),
+        "SKHY_HBM_Supply_Chain": ("SKHY", "MU"),
+        "SKHY_Post_Market_KOSPI": ("SKHY", None)
+    }
+
+    ticker, lead_ticker = target_map.get(strat_name, (None, None))
+    if not ticker:
+        return None
+
+    df = get_market_data(ticker)
+    if df.empty or len(df) < 25:
+        return None
+
+    z_score, rvol = calculate_zscore_and_rvol(df)
+    current_price = float(df["Close"].iloc[-1])
+
+    # --- NOISE FILTER 1: Earnings Verification ---
+    if strat_name in ["US_Earnings_Lag", "FX_Adjusted_Earnings_Arb", "Biotech_News_Lag"]:
+        if not is_earnings_event_today(ticker):
+            return None  # Filter noise: No confirmed earnings release today
+        if abs(z_score) < 2.5 or rvol < 2.0:
+            return None  # Filter noise: Post-earnings move lacked volume/volatility
+
+    # --- NOISE FILTER 2: SKHY Cluster Differentiation ---
+    elif strat_name == "SKHY_ADR_FX_Neutralization":
+        # Requires extreme FX-adjusted spread anomaly vs Korean KOSPI close
+        if abs(z_score) < 2.8 or rvol < 2.2:
+            return None
+    elif strat_name == "SKHY_HBM_Supply_Chain":
+        # Requires Micron/Semiconductor lead asset move confirmation
+        lead_df = get_market_data(lead_ticker) if lead_ticker else pd.DataFrame()
+        if lead_df.empty:
+            return None
+        lead_z, lead_rvol = calculate_zscore_and_rvol(lead_df)
+        if lead_z < 2.5 or lead_rvol < 2.5:
+            return None  # Filter noise: Lead memory chip maker did not break out
+    elif strat_name == "SKHY_Post_Market_KOSPI":
+        # Requires ultra-high volatility shock near market session boundary
+        if abs(z_score) < 3.0 or rvol < 2.5:
+            return None
+
+    # --- NOISE FILTER 3: Lead/Lag Asset Confirmations ---
+    elif lead_ticker:
+        lead_df = get_market_data(lead_ticker)
+        if not lead_df.empty:
+            lead_z, lead_rvol = calculate_zscore_and_rvol(lead_df)
+            if abs(lead_z) < 2.2 or lead_rvol < 1.8:
+                return None  # Filter noise: Lead ticker did not move significantly
+
+    # --- NOISE FILTER 4: General Volatility & Volume Gate ---
+    else:
+        if abs(z_score) < 2.5 or rvol < 2.0:
+            return None  # Filter noise: Standard random walk fluctuation
+
+    # If all statistical filters pass, construct trade proposal
+    direction = "LONG" if z_score > 0 else "SHORT"
+    
+    # 1.5% TP / 0.8% SL targets
+    tp_price = current_price * 1.015 if direction == "LONG" else current_price * 0.985
+    sl_price = current_price * 0.992 if direction == "LONG" else current_price * 1.008
+
+    return {
+        "ticker": ticker,
+        "direction": direction,
+        "entry_price": current_price,
+        "tp_price": tp_price,
+        "sl_price": sl_price,
+        "z_score": z_score,
+        "rvol": rvol
+    }
+
+# -------------------------------------------------------------------
+# Engine Step 3: Execute Trades & Save State
+# -------------------------------------------------------------------
+
+def run_trading_scan(state):
+    print("\n--- Scanning Markets for Genuine Signals ---")
+    now_str = datetime.now(timezone.utc).isoformat()
+    
     for strat_name, strat_data in state["strategies"].items():
-        # Maximum 1 active position per strategy at a time
-        if len(strat_data["positions"]) > 0:
+        # Avoid opening new positions if already active
+        if len(strat_data.get("positions", [])) > 0:
+            continue
+            
+        cash = strat_data.get("cash", 0.0)
+        if cash < 2000.0:  # Minimum cash threshold
             continue
 
-        cfg = STRATEGIES_CONFIG[strat_name]
-        watch_price = fetch_latest_price(cfg["watch"])
-        trade_price = fetch_latest_price(cfg["trade"])
-
-        if not watch_price or not trade_price:
+        signal = evaluate_strategy_signal(strat_name)
+        if not signal:
             continue
 
-        # Strategy Signal Trigger (Standardized 0.5% momentum delta check)
-        signal = "LONG" if watch_price > trade_price * 1.005 else None
+        ticker = signal["ticker"]
+        entry_price = signal["entry_price"]
+        direction = signal["direction"]
+        
+        # Risk Allocation: Deploy 90% of available strategy cash
+        capital_to_deploy = cash * 0.90
+        qty = math.floor(capital_to_deploy / entry_price)
+        if qty <= 0:
+            continue
 
-        if signal:
-            cash = strat_data["cash"]
-            if cash < 500: # Minimum capital safety buffer
-                continue
+        trade_value = qty * entry_price
+        entry_fee = get_broker_fee(ticker, trade_value)
+        total_cost = trade_value + entry_fee
 
-            trade_amount = cash * 0.95 # Deploy 95% of available strategy cash
-            qty = int(trade_amount / trade_price) if cfg["asset_type"] != "FUTURES" else max(1, int(trade_amount / (trade_price * 0.10)))
+        # Deduct cash & log position
+        strat_data["cash"] -= total_cost
+        position = {
+            "ticker": ticker,
+            "direction": direction,
+            "entry_price": entry_price,
+            "qty": qty,
+            "tp_price": signal["tp_price"],
+            "sl_price": signal["sl_price"],
+            "entry_fee": entry_fee,
+            "entry_time": now_str
+        }
+        strat_data["positions"].append(position)
 
-            if qty <= 0:
-                continue
+        print(f"[SIGNAL DETECTED] {strat_name}: BUY {qty} {ticker} @ ${entry_price:.2f} (Z-Score: {signal['z_score']:.2f}, RVOL: {signal['rvol']:.2f})")
 
-            entry_fee = calculate_ibkr_fee(cfg["asset_type"], qty, trade_price)
-            tp_price = trade_price * (1 + cfg["tp_pct"]) if signal == "LONG" else trade_price * (1 - cfg["tp_pct"])
-            sl_price = trade_price * (1 - cfg["sl_pct"]) if signal == "LONG" else trade_price * (1 + cfg["sl_pct"])
+        log_trade_history({
+            "timestamp": now_str,
+            "strategy": strat_name,
+            "ticker": ticker,
+            "action": "BUY",
+            "qty": qty,
+            "price": entry_price,
+            "gross_pnl": 0.0,
+            "fee": round(entry_fee, 2),
+            "net_pnl": 0.0,
+            "reason": f"SIGNAL_ENTRY (Z={signal['z_score']:.2f})"
+        })
 
-            position = {
-                "ticker": cfg["trade"],
-                "direction": signal,
-                "entry_price": trade_price,
-                "qty": qty,
-                "tp_price": tp_price,
-                "sl_price": sl_price,
-                "entry_fee": entry_fee,
-                "entry_time": datetime.now(timezone.utc).isoformat()
-            }
+# -------------------------------------------------------------------
+# Main Execution Entry Point
+# -------------------------------------------------------------------
 
-            strat_data["cash"] -= (qty * trade_price) + entry_fee
-            strat_data["positions"].append(position)
-            print(f"[{strat_name}] OPENED {signal} on {cfg['trade']} at ${trade_price:.2f}. Qty: {qty}, TP: ${tp_price:.2f}, SL: ${sl_price:.2f}")
-
-    save_state(state)
-    print(f"[{now_str}] Engine Run Complete. Portfolio state persisted.")
+def main():
+    print(f"=== LagTrader Engine Run Started: {datetime.now(timezone.utc).isoformat()} ===")
+    
+    # 1. Load Portfolio
+    state = load_portfolio_state()
+    
+    # 2. Process Existing Position Exits
+    process_open_positions(state)
+    
+    # 3. Scan & Filter New Signals
+    run_trading_scan(state)
+    
+    # 4. Save State
+    save_portfolio_state(state)
+    print("=== Execution Run Complete. State Updated. ===")
 
 if __name__ == "__main__":
-    process_engine()
+    main()
