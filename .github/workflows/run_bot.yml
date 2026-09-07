@@ -6,6 +6,10 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch: # Allows manual trigger from the UI anytime
 
+# Explicitly grant write access to repository contents
+permissions:
+  contents: write
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -29,7 +33,7 @@ jobs:
 
       - name: Commit Trade Logs & Portfolio State
         run: |
-          git config --global user.name 'NostraTrade Bot'
-          git config --global user.email 'bot@nostratrade.com'
-          git add data/portfolio_state.json data/trade_history.csv
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update paper trades [skip ci]" && git push)
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A data/
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update paper trades [skip ci]" && git push origin HEAD:${{ github.ref }})
