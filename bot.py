@@ -3,7 +3,6 @@ import sys
 import json
 import time
 import csv
-import io
 import zipfile
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -79,18 +78,28 @@ def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, b
         sl_price = round(entry_price + (1.5 * atr_14), 2)
     return tp_price, sl_price
 
-def format_trigger_time(signal_time_iso: str, action_time_iso: str = None) -> str:
-    t_sig = datetime.fromisoformat(signal_time_iso)
-    t_act = datetime.fromisoformat(action_time_iso) if action_time_iso else datetime.now(timezone.utc)
-    elapsed_sec = int((t_act - t_sig).total_seconds())
-    hours = elapsed_sec // 3600
-    minutes = (elapsed_sec % 3600) // 60
-    seconds = elapsed_sec % 60
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    elif minutes > 0:
-        return f"{minutes}m {seconds}s"
-    return f"{seconds}s"
+def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
+    """Safe trigger time calculation that never crashes on None or invalid formats."""
+    if not signal_time_iso or not isinstance(signal_time_iso, str):
+        return "N/A"
+    try:
+        t_sig = datetime.fromisoformat(signal_time_iso)
+        if action_time_iso and isinstance(action_time_iso, str):
+            t_act = datetime.fromisoformat(action_time_iso)
+        else:
+            t_act = datetime.now(timezone.utc)
+        
+        elapsed_sec = max(0, int((t_act - t_sig).total_seconds()))
+        hours = elapsed_sec // 3600
+        minutes = (elapsed_sec % 3600) // 60
+        seconds = elapsed_sec % 60
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        elif minutes > 0:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+    except Exception:
+        return "N/A"
 
 # =====================================================================
 # Portfolio Manager
@@ -120,10 +129,10 @@ class PortfolioManager:
         return state
 
     def _reconcile_roster(self, data):
-        if "strategies" not in data:
+        if "strategies" not in data or not isinstance(data["strategies"], dict):
             data["strategies"] = {}
         for strat in STRATEGY_ROSTER:
-            if strat not in data["strategies"]:
+            if strat not in data["strategies"] or not isinstance(data["strategies"][strat], dict):
                 data["strategies"][strat] = {"allocated": 10000.0, "cash": 10000.0, "positions": []}
 
     def save(self):
@@ -136,7 +145,7 @@ class PortfolioManager:
         if os.path.exists(HISTORY_PATH):
             try:
                 df = pd.read_csv(HISTORY_PATH)
-                if not df.empty:
+                if not df.empty and "strategy" in df.columns and "net_pnl" in df.columns:
                     for strat, group in df.groupby("strategy"):
                         wins = int((group["net_pnl"] > 0).sum())
                         losses = int((group["net_pnl"] <= 0).sum())
@@ -144,50 +153,83 @@ class PortfolioManager:
                         win_rate = round((wins / total) * 100, 1) if total > 0 else 0.0
                         stats[strat] = {"wins": wins, "losses": losses, "win_rate": win_rate}
             except Exception as e:
-                print(f"[WARN] CSV parse failure for stats: {e}")
+                print(f"[WARN] CSV parse failure: {e}")
         return stats
 
     def get_dashboard_payload(self):
-        """Generates real-time snapshot for the web dashboard."""
-        stats = self.get_strategy_stats()
-        total_wins = sum(s["wins"] for s in stats.values())
-        total_losses = sum(s["losses"] for s in stats.values())
-        total_trades = total_wins + total_losses
-        overall_win_rate = round((total_wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
+        """Safe payload generation for the live dashboard."""
+        try:
+            stats = self.get_strategy_stats()
+            total_wins = sum(s["wins"] for s in stats.values())
+            total_losses = sum(s["losses"] for s in stats.values())
+            total_trades = total_wins + total_losses
+            overall_win_rate = round((total_wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
 
-        all_orders = []
-        with self.lock:
-            for strat_name, strat in self.data.get("strategies", {}).items():
-                for pos in strat.get("positions", []):
-                    pos_copy = dict(pos)
-                    pos_copy["pull_trigger_time"] = format_trigger_time(pos.get("signal_time"), pos.get("action_time"))
-                    all_orders.append(pos_copy)
+            all_orders = []
+            with self.lock:
+                strategies_data = self.data.get("strategies", {})
+                for strat_name, strat in strategies_data.items():
+                    if not isinstance(strat, dict):
+                        continue
+                    for pos in strat.get("positions", []):
+                        if not isinstance(pos, dict):
+                            continue
+                        pos_copy = dict(pos)
+                        pos_copy["strategy"] = strat_name
+                        pos_copy["status"] = pos.get("status", "ACTIVE")
+                        # Handle both new 'action_ticker' and legacy 'ticker'
+                        pos_copy["action_ticker"] = pos.get("action_ticker") or pos.get("ticker", "UNKNOWN")
+                        pos_copy["action_market"] = pos.get("action_market", "NYSE")
+                        pos_copy["direction"] = pos.get("direction", "BUY")
+                        pos_copy["qty"] = pos.get("qty", 100)
+                        pos_copy["entry_price"] = round(float(pos.get("entry_price", 0.0)), 2)
+                        pos_copy["tp_price"] = round(float(pos.get("tp_price", 0.0)), 2)
+                        pos_copy["sl_price"] = round(float(pos.get("sl_price", 0.0)), 2)
+                        
+                        sig_time = pos.get("signal_time") or pos.get("entry_time")
+                        act_time = pos.get("action_time") or pos.get("entry_time")
+                        pos_copy["pull_trigger_time"] = format_trigger_time(sig_time, act_time)
+                        all_orders.append(pos_copy)
 
-        return {
-            "status": "online",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "kpi": {
-                "total_capital": self.data.get("total_capital", 240000.0),
-                "total_wins": total_wins,
-                "total_losses": total_losses,
-                "win_rate": overall_win_rate
-            },
-            "orders": all_orders,
-            "strategies": [
-                {
+            strat_list = []
+            for s in STRATEGY_ROSTER:
+                s_dict = self.data.get("strategies", {}).get(s, {})
+                allocated = s_dict.get("allocated", 10000.0) if isinstance(s_dict, dict) else 10000.0
+                cash = s_dict.get("cash", 10000.0) if isinstance(s_dict, dict) else 10000.0
+                s_stat = stats.get(s, {"wins": 0, "losses": 0, "win_rate": 0.0})
+                strat_list.append({
                     "name": s,
-                    "wins": stats[s]["wins"],
-                    "losses": stats[s]["losses"],
-                    "win_rate": stats[s]["win_rate"],
-                    "allocated": self.data["strategies"].get(s, {}).get("allocated", 10000.0),
-                    "cash": self.data["strategies"].get(s, {}).get("cash", 10000.0)
-                }
-                for s in STRATEGY_ROSTER
-            ]
-        }
+                    "wins": s_stat["wins"],
+                    "losses": s_stat["losses"],
+                    "win_rate": s_stat["win_rate"],
+                    "allocated": round(float(allocated), 2),
+                    "cash": round(float(cash), 2)
+                })
+
+            return {
+                "status": "online",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "kpi": {
+                    "total_capital": round(float(self.data.get("total_capital", 240000.0)), 2),
+                    "total_wins": total_wins,
+                    "total_losses": total_losses,
+                    "win_rate": overall_win_rate
+                },
+                "orders": all_orders,
+                "strategies": strat_list
+            }
+        except Exception as e:
+            print(f"[ERROR] get_dashboard_payload error: {e}")
+            return {
+                "status": "online",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "kpi": {"total_capital": 240000.0, "total_wins": 0, "total_losses": 0, "win_rate": 0.0},
+                "orders": [],
+                "strategies": [{"name": s, "wins": 0, "losses": 0, "win_rate": 0.0, "allocated": 10000.0, "cash": 10000.0} for s in STRATEGY_ROSTER]
+            }
 
 # =====================================================================
-# Web API & Health-Check Server (For Dashboard & UptimeRobot)
+# Web API & Health-Check Server
 # =====================================================================
 
 ENGINE_INSTANCE = None
@@ -210,40 +252,60 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == "/api/data":
-            # Live dashboard data feed
-            if ENGINE_INSTANCE:
-                payload = ENGINE_INSTANCE.portfolio_mgr.get_dashboard_payload()
-            else:
-                payload = {"status": "starting"}
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self._send_cors_headers()
-            self.end_headers()
-            self.wfile.write(json.dumps(payload).encode("utf-8"))
-
-        elif self.path == "/api/backup":
-            # Direct CSV download in browser for instant offline backup
-            if os.path.exists(HISTORY_PATH):
+        try:
+            parsed_path = self.path.split("?")[0]
+            if parsed_path == "/api/data":
+                payload = ENGINE_INSTANCE.portfolio_mgr.get_dashboard_payload() if ENGINE_INSTANCE else {"status": "starting"}
+                body = json.dumps(payload).encode("utf-8")
                 self.send_response(200)
-                self.send_header("Content-type", "text/csv")
-                self.send_header("Content-Disposition", "attachment; filename=trade_history.csv")
+                self.send_header("Content-type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
                 self._send_cors_headers()
                 self.end_headers()
-                with open(HISTORY_PATH, "rb") as f:
-                    self.wfile.write(f.read())
-            else:
-                self.send_response(404)
-                self.end_headers()
+                self.wfile.write(body)
 
-        else:
-            # Root ping endpoint for UptimeRobot
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self._send_cors_headers()
-            self.end_headers()
-            response = {"status": "online", "system": "LagTrader Engine", "timestamp": datetime.now(timezone.utc).isoformat()}
-            self.wfile.write(json.dumps(response).encode("utf-8"))
+            elif parsed_path == "/api/backup":
+                if os.path.exists(HISTORY_PATH):
+                    with open(HISTORY_PATH, "rb") as f:
+                        data = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/csv")
+                    self.send_header("Content-Disposition", "attachment; filename=trade_history.csv")
+                    self.send_header("Content-Length", str(len(data)))
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    body = b"No trade history yet."
+                    self.send_response(404)
+                    self.send_header("Content-type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            else:
+                response = {"status": "online", "system": "LagTrader Engine", "timestamp": datetime.now(timezone.utc).isoformat()}
+                body = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(body)
+
+        except Exception as e:
+            print(f"[ERROR] HTTP handler: {e}")
+            try:
+                err_body = json.dumps({"error": str(e)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.send_header("Content-Length", str(len(err_body)))
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(err_body)
+            except Exception:
+                pass
 
     def log_message(self, format, *args):
         return
@@ -313,61 +375,21 @@ class ExecutionEngine:
         updated = False
         with self.portfolio_mgr.lock:
             for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
+                if not isinstance(strat_info, dict):
+                    continue
                 for pos in strat_info.get("positions", []):
+                    if not isinstance(pos, dict):
+                        continue
                     if pos.get("status") == "PENDING_MARKET_OPEN":
                         if is_market_open(pos.get("action_market", "NYSE")):
                             pos["status"] = "ACTIVE"
                             pos["action_time"] = datetime.now(timezone.utc).isoformat()
                             updated = True
-                            ttt_str = format_trigger_time(pos["signal_time"], pos["action_time"])
-                            print(f"[MARKET OPENED] Activated order for {pos['action_ticker']}. Pull Trigger Time: {ttt_str}")
+                            ttt_str = format_trigger_time(pos.get("signal_time"), pos.get("action_time"))
+                            print(f"[MARKET OPENED] Activated order for {pos.get('action_ticker')}. Pull Trigger Time: {ttt_str}")
 
         if updated:
             self.portfolio_mgr.save()
-
-    def close_position(self, strat_name: str, action_ticker: str, exit_price: float, reason: str = "TAKE_PROFIT"):
-        strat_info = self.portfolio_mgr.data["strategies"].get(strat_name)
-        if not strat_info:
-            return
-
-        remaining = []
-        with self.portfolio_mgr.lock:
-            for pos in strat_info.get("positions", []):
-                if pos["action_ticker"] == action_ticker and pos["status"] == "ACTIVE":
-                    qty = pos["qty"]
-                    entry_price = pos["entry_price"]
-                    direction = pos.get("direction", "BUY")
-
-                    multiplier = 1 if direction == "BUY" else -1
-                    gross_pnl = round((exit_price - entry_price) * qty * multiplier, 2)
-                    fee = round(max(1.00, qty * 0.005), 2)
-                    net_pnl = round(gross_pnl - fee, 2)
-                    ttt_str = format_trigger_time(pos["signal_time"], pos["action_time"])
-
-                    with open(HISTORY_PATH, "a", newline="") as f:
-                        writer = csv.writer(f)
-                        writer.writerow([
-                            datetime.now(timezone.utc).isoformat(),
-                            strat_name,
-                            pos.get("signal_ticker"),
-                            pos.get("action_ticker"),
-                            f"CLOSE_{direction}",
-                            qty,
-                            exit_price,
-                            gross_pnl,
-                            fee,
-                            net_pnl,
-                            ttt_str,
-                            reason
-                        ])
-
-                    strat_info["cash"] = round(strat_info["cash"] + net_pnl, 2)
-                    print(f"[CLOSED TRADE] {strat_name} ({action_ticker}) | Net PnL: ${net_pnl} | Reason: {reason}")
-                else:
-                    remaining.append(pos)
-
-            strat_info["positions"] = remaining
-        self.portfolio_mgr.save()
 
 # =====================================================================
 # Main Loop
