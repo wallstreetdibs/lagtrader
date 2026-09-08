@@ -5,6 +5,7 @@ import time
 import csv
 import zipfile
 import threading
+import base64
 import urllib.request
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -26,11 +27,14 @@ BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 PORTFOLIO_PATH = os.path.join(DATA_DIR, "portfolio_state.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.csv")
 
-# Port dynamically assigned by Render or defaults to 8080
 HTTP_PORT = int(os.environ.get("PORT", 8080))
 
-# TwelveData API Key (configured as default backup to Yahoo Finance)
+# TwelveData API Key (fallback price provider)
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "e5412639c4844ff8b877be3f53b69c9d")
+
+# GitHub Persistence Configuration (Optional: auto-commits trade history)
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")    # format: "username/repository"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")  # GitHub Personal Access Token
 
 STRATEGY_ROSTER = [
     "ASX_ADR_Arbitrage", "US_Earnings_Lag", "Inventory_Drift_Reversal",
@@ -58,6 +62,82 @@ EXCHANGE_HOURS_UTC = {
 }
 
 # =====================================================================
+# GitHub Automatic State Persistence (Surviving Render Restarts)
+# =====================================================================
+
+def pull_file_from_github(file_path: str, repo: str, token: str):
+    """Downloads the latest file from GitHub on container boot if missing locally."""
+    if not repo or not token:
+        return False
+    try:
+        filename = os.path.basename(file_path)
+        repo_path = f"data/{filename}"
+        api_url = f"https://api.github.com/repos/{repo}/contents/{repo_path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "LagTrader-Bot"
+        }
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            content_b64 = data.get("content", "")
+            if content_b64:
+                file_bytes = base64.b64decode(content_b64)
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, "wb") as f:
+                    f.write(file_bytes)
+                print(f"📥 [GITHUB SYNC] Restored latest {filename} from GitHub repository!")
+                return True
+    except Exception:
+        pass
+    return False
+
+def sync_file_to_github(file_path: str, repo: str, token: str, commit_msg: str):
+    """Automatically commits state files back to GitHub so data is permanently safe."""
+    if not repo or not token or not os.path.exists(file_path):
+        return False
+    try:
+        filename = os.path.basename(file_path)
+        repo_path = f"data/{filename}"
+        api_url = f"https://api.github.com/repos/{repo}/contents/{repo_path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "LagTrader-Bot"
+        }
+
+        # Check existing file SHA
+        sha = None
+        try:
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                sha = data.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print(f"[GITHUB SYNC] Error looking up SHA: {e}")
+
+        # Base64 encode file content
+        with open(file_path, "rb") as f:
+            content_bytes = f.read()
+        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
+
+        payload = {"message": commit_msg, "content": content_b64}
+        if sha:
+            payload["sha"] = sha
+
+        put_req = urllib.request.Request(
+            api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT"
+        )
+        with urllib.request.urlopen(put_req, timeout=10):
+            print(f"📦 [GITHUB SYNC] Successfully auto-committed {filename} to GitHub!")
+            return True
+    except Exception as e:
+        print(f"[GITHUB SYNC ERROR] {e}")
+        return False
+
+# =====================================================================
 # Market Calendar & US Holiday Intelligence
 # =====================================================================
 
@@ -66,19 +146,19 @@ def is_us_holiday(d: date) -> bool:
     if d.month == 1 and d.day == 1:
         return True  # New Year's Day
     if d.month == 1 and d.weekday() == 0 and 15 <= d.day <= 21:
-        return True  # MLK Day (3rd Monday in Jan)
+        return True  # MLK Day
     if d.month == 2 and d.weekday() == 0 and 15 <= d.day <= 21:
-        return True  # Presidents' Day (3rd Monday in Feb)
+        return True  # Presidents' Day
     if d.month == 5 and d.weekday() == 0 and d.day >= 25:
-        return True  # Memorial Day (Last Monday in May)
+        return True  # Memorial Day
     if d.month == 6 and d.day == 19:
         return True  # Juneteenth
     if d.month == 7 and d.day == 4:
         return True  # Independence Day
     if d.month == 9 and d.weekday() == 0 and 1 <= d.day <= 7:
-        return True  # Labor Day (1st Monday in Sept)
+        return True  # Labor Day
     if d.month == 11 and d.weekday() == 3 and 22 <= d.day <= 28:
-        return True  # Thanksgiving (4th Thursday in Nov)
+        return True  # Thanksgiving
     if d.month == 12 and d.day == 25:
         return True  # Christmas Day
     return False
@@ -92,7 +172,7 @@ def is_market_open(market_name: str, now: datetime = None) -> bool:
     if market == "CRYPTO":
         return True
 
-    weekday = now.weekday()  # 0 = Mon, 4 = Fri, 5 = Sat, 6 = Sun
+    weekday = now.weekday()
     utc_hour = now.hour + (now.minute / 60.0)
 
     # Saturday: All global stock & futures exchanges closed
@@ -101,10 +181,8 @@ def is_market_open(market_name: str, now: datetime = None) -> bool:
 
     # Sunday:
     if weekday == 6:
-        # CME futures open Sunday at 22:00 UTC (6:00 PM US Eastern)
         if market == "CME":
             return utc_hour >= 22.0
-        # Australia (ASX) opens Sunday at 23:00 UTC (Monday 9:00 AM Sydney)
         if market == "ASX":
             return utc_hour >= 23.0
         return False
@@ -122,7 +200,6 @@ def is_market_open(market_name: str, now: datetime = None) -> bool:
         return True
 
     if open_h > close_h:
-        # Overnight UTC session (e.g. ASX: 23:00 to 06:00 UTC)
         return utc_hour >= open_h or utc_hour <= close_h
 
     return open_h <= utc_hour <= close_h
@@ -154,7 +231,6 @@ def fetch_live_price(ticker: str):
     if not ticker:
         return None
 
-    # 1. Primary: yfinance fast_info (ultra-low memory & fast)
     if YFINANCE_AVAILABLE:
         try:
             t = yf.Ticker(ticker)
@@ -169,7 +245,6 @@ def fetch_live_price(ticker: str):
         except Exception:
             pass
 
-    # 2. Backup: TwelveData API
     if TWELVEDATA_API_KEY:
         td_price = fetch_twelvedata_price(ticker, TWELVEDATA_API_KEY)
         if td_price is not None and td_price > 0:
@@ -184,6 +259,12 @@ def fetch_live_price(ticker: str):
 def ensure_environment():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
+
+    # Restore from GitHub on boot if available
+    if GITHUB_REPO and GITHUB_TOKEN:
+        pull_file_from_github(PORTFOLIO_PATH, GITHUB_REPO, GITHUB_TOKEN)
+        pull_file_from_github(HISTORY_PATH, GITHUB_REPO, GITHUB_TOKEN)
+
     if not os.path.exists(HISTORY_PATH):
         with open(HISTORY_PATH, "w", newline="") as f:
             writer = csv.writer(f)
@@ -194,11 +275,6 @@ def ensure_environment():
             ])
 
 def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, beta: float = 1.0, atr_14: float = 0.50, direction: str = "BUY"):
-    """
-    Dynamic TP/SL engine for both LONG and SHORT:
-    BUY:  TP = Entry + Target Move, SL = Entry - (1.5 * ATR)
-    SELL: TP = Entry - Target Move, SL = Entry + (1.5 * ATR)
-    """
     expected_move_pct = (signal_discrepancy_pct * beta) * 0.80
     direction_clean = direction.upper()
 
@@ -212,7 +288,6 @@ def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, b
     return tp_price, sl_price
 
 def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
-    """Calculates Pull the Trigger Time including all queuing time."""
     if not signal_time_iso or not isinstance(signal_time_iso, str):
         return "N/A"
     try:
@@ -335,7 +410,6 @@ class PortfolioManager:
                     "cash": round(float(cash), 2)
                 })
 
-            # Load last 5 completed trades for dashboard
             recent_trades = []
             if os.path.exists(HISTORY_PATH):
                 try:
@@ -370,7 +444,7 @@ class PortfolioManager:
             }
 
 # =====================================================================
-# Web API & Health-Check Server
+# Web API & Webhook Server (GET /api/data & POST /api/signal)
 # =====================================================================
 
 ENGINE_INSTANCE = None
@@ -378,8 +452,17 @@ ENGINE_INSTANCE = None
 class DashboardAPIHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+    def _send_json_response(self, code: int, payload: dict):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -397,13 +480,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             parsed_path = self.path.split("?")[0]
             if parsed_path == "/api/data":
                 payload = ENGINE_INSTANCE.portfolio_mgr.get_dashboard_payload() if ENGINE_INSTANCE else {"status": "starting"}
-                body = json.dumps(payload).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self._send_cors_headers()
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_json_response(200, payload)
 
             elif parsed_path == "/api/backup":
                 if os.path.exists(HISTORY_PATH):
@@ -417,35 +494,43 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(data)
                 else:
-                    body = b"No trade history yet."
-                    self.send_response(404)
-                    self.send_header("Content-type", "text/plain")
-                    self.send_header("Content-Length", str(len(body)))
-                    self._send_cors_headers()
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._send_json_response(404, {"status": "error", "message": "No trade history yet."})
 
             else:
-                response = {"status": "online", "system": "LagTrader Engine", "timestamp": datetime.now(timezone.utc).isoformat()}
-                body = json.dumps(response).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self._send_cors_headers()
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_json_response(200, {
+                    "status": "online", "system": "LagTrader Engine", "timestamp": datetime.now(timezone.utc).isoformat()
+                })
 
         except Exception as e:
-            try:
-                err_body = json.dumps({"error": str(e)}).encode("utf-8")
-                self.send_response(500)
-                self.send_header("Content-type", "application/json")
-                self.send_header("Content-Length", str(len(err_body)))
-                self._send_cors_headers()
-                self.end_headers()
-                self.wfile.write(err_body)
-            except Exception:
-                pass
+            self._send_json_response(500, {"status": "error", "message": str(e)})
+
+    def do_POST(self):
+        """Webhook listener for incoming signals from TradingView, curl, or external bots."""
+        try:
+            parsed_path = self.path.split("?")[0]
+            if parsed_path == "/api/signal":
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len == 0:
+                    self._send_json_response(400, {"status": "error", "message": "Empty signal body"})
+                    return
+
+                post_data = self.rfile.read(content_len)
+                payload = json.loads(post_data.decode("utf-8"))
+
+                if not ENGINE_INSTANCE:
+                    self._send_json_response(503, {"status": "error", "message": "Engine starting"})
+                    return
+
+                success, msg = ENGINE_INSTANCE.process_signal(payload)
+                status_code = 200 if success else 400
+                self._send_json_response(status_code, {
+                    "status": "accepted" if success else "rejected",
+                    "message": msg
+                })
+            else:
+                self._send_json_response(404, {"status": "error", "message": "Endpoint not found"})
+        except Exception as e:
+            self._send_json_response(500, {"status": "error", "message": str(e)})
 
     def log_message(self, format, *args):
         return
@@ -454,10 +539,10 @@ def start_server(port=HTTP_PORT):
     server = ThreadingHTTPServer(("0.0.0.0", port), DashboardAPIHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print(f"[SERVER] Listening on port {port} (/api/data & /)")
+    print(f"[SERVER] Listening on port {port} (GET /api/data & POST /api/signal)")
 
 # =====================================================================
-# Execution Engine
+# Execution Engine (With Real Cash Accounting)
 # =====================================================================
 
 class ExecutionEngine:
@@ -469,19 +554,42 @@ class ExecutionEngine:
         start_server()
 
     def process_signal(self, signal_payload: dict):
+        """Processes incoming signal with strict Cash & Margin allocation."""
+        strat_name = signal_payload.get("strategy")
+        if not strat_name or strat_name not in STRATEGY_ROSTER:
+            return False, f"Unknown or missing strategy '{strat_name}'"
+
+        action_ticker = signal_payload.get("action_ticker")
+        if not action_ticker:
+            return False, "Missing 'action_ticker'"
+
         signal_time = signal_payload.get("signal_time", datetime.now(timezone.utc).isoformat())
-        strat_name = signal_payload["strategy"]
         action_market = signal_payload.get("action_market", "NYSE")
         
         market_open = is_market_open(action_market)
         order_status = "ACTIVE" if market_open else "PENDING_MARKET_OPEN"
         action_time = datetime.now(timezone.utc).isoformat() if market_open else None
 
-        entry_price = signal_payload.get("entry_price", 100.0)
-        discrepancy = signal_payload.get("discrepancy_pct", 1.5)
-        beta = signal_payload.get("beta", 1.0)
-        atr_14 = signal_payload.get("atr_14", 0.50)
+        entry_price = float(signal_payload.get("entry_price", 100.0))
+        discrepancy = float(signal_payload.get("discrepancy_pct", 1.5))
+        beta = float(signal_payload.get("beta", 1.0))
+        atr_14 = float(signal_payload.get("atr_14", 0.50))
         direction = signal_payload.get("direction", "BUY").upper()
+        qty = int(signal_payload.get("qty", 100))
+
+        # 1. Cash & Margin Check: Deduct capital on trade entry
+        required_capital = round(qty * entry_price, 2)
+        strat_dict = self.portfolio_mgr.data["strategies"].setdefault(
+            strat_name, {"allocated": 10000.0, "cash": 10000.0, "positions": []}
+        )
+        available_cash = strat_dict.get("cash", 10000.0)
+
+        if available_cash < required_capital:
+            print(f"❌ [ORDER REJECTED] {strat_name}: Insufficient cash (Required: ${required_capital}, Available: ${available_cash})")
+            return False, f"Insufficient cash: Required ${required_capital:.2f}, Available ${available_cash:.2f}"
+
+        # Deduct reserved cash
+        strat_dict["cash"] = round(available_cash - required_capital, 2)
 
         tp, sl = calculate_dynamic_tp_sl(entry_price, discrepancy, beta, atr_14, direction)
 
@@ -491,28 +599,27 @@ class ExecutionEngine:
             "strategy": strat_name,
             "signal_ticker": signal_payload.get("signal_ticker", "-"),
             "signal_market": signal_payload.get("signal_market", "-"),
-            "action_ticker": signal_payload.get("action_ticker"),
+            "action_ticker": action_ticker,
             "action_market": action_market,
             "direction": direction,
-            "qty": signal_payload.get("qty", 100),
+            "qty": qty,
             "entry_price": entry_price,
+            "invested_capital": required_capital,
             "tp_price": tp,
             "sl_price": sl,
             "signal_time": signal_time,
             "action_time": action_time
         }
 
-        strat_dict = self.portfolio_mgr.data["strategies"].setdefault(
-            strat_name, {"allocated": 10000.0, "cash": 10000.0, "positions": []}
-        )
         strat_dict["positions"].append(position_record)
         self.portfolio_mgr.save()
 
         ttt_str = format_trigger_time(signal_time, action_time)
-        print(f"[{order_status}] Strategy: {strat_name} | {direction} {position_record['action_ticker']} ({action_market}) | TP: {tp} | SL: {sl} | Trigger Time: {ttt_str}")
+        print(f"[{order_status}] {strat_name} | {direction} {action_ticker} ({action_market}) | Cost: ${required_capital} | Cash Left: ${strat_dict['cash']} | TP: {tp} | SL: {sl} | Trigger: {ttt_str}")
+        return True, f"Order {position_record['order_id']} placed successfully ({order_status})"
 
     def process_pending_queues(self):
-        """Activates queued orders when the Action Market opens, updating entry price to real market open."""
+        """Activates queued orders when Action Market opens, updating entry price to real market open."""
         updated = False
         with self.portfolio_mgr.lock:
             for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
@@ -527,9 +634,16 @@ class ExecutionEngine:
                             ticker = pos.get("action_ticker")
                             real_open_price = fetch_live_price(ticker)
                             
-                            # Update entry price & TP/SL to actual market open
                             if real_open_price and real_open_price > 0:
+                                old_cost = pos.get("invested_capital", pos["entry_price"] * pos["qty"])
+                                new_cost = round(real_open_price * pos["qty"], 2)
+                                cost_diff = round(new_cost - old_cost, 2)
+                                
+                                # Adjust cash for gap opening difference
+                                strat_info["cash"] = round(strat_info.get("cash", 0.0) - cost_diff, 2)
                                 pos["entry_price"] = real_open_price
+                                pos["invested_capital"] = new_cost
+                                
                                 direction = pos.get("direction", "BUY")
                                 tp, sl = calculate_dynamic_tp_sl(real_open_price, 1.5, 1.0, 0.50, direction)
                                 pos["tp_price"] = tp
@@ -539,7 +653,7 @@ class ExecutionEngine:
                             pos["action_time"] = datetime.now(timezone.utc).isoformat()
                             updated = True
                             ttt_str = format_trigger_time(pos.get("signal_time"), pos.get("action_time"))
-                            print(f"[MARKET OPENED] Placed {pos.get('direction')} for {ticker} at ${pos['entry_price']}. Pull Trigger Time: {ttt_str}")
+                            print(f"[MARKET OPENED] Order placed for {ticker} at ${pos['entry_price']}. Pull Trigger Time: {ttt_str}")
 
         if updated:
             self.portfolio_mgr.save()
@@ -558,7 +672,6 @@ class ExecutionEngine:
                     if pos.get("status") == "ACTIVE":
                         action_mkt = pos.get("action_market", "NYSE")
                         
-                        # Zero queries if that market is closed
                         if not is_market_open(action_mkt):
                             continue
 
@@ -602,11 +715,15 @@ class ExecutionEngine:
                     entry_price = pos.get("entry_price", exit_price)
                     direction = pos.get("direction", "BUY").upper()
 
-                    # Multiplier: +1 for Long, -1 for Short
                     multiplier = 1 if direction in ["BUY", "LONG"] else -1
                     gross_pnl = round((exit_price - entry_price) * qty * multiplier, 2)
                     fee = round(max(1.00, qty * 0.005), 2)
                     net_pnl = round(gross_pnl - fee, 2)
+
+                    # Return initial invested capital + profit/loss back to strategy cash
+                    invested = pos.get("invested_capital", round(qty * entry_price, 2))
+                    returned_total = round(invested + net_pnl, 2)
+                    strat_info["cash"] = round(strat_info.get("cash", 0.0) + returned_total, 2)
                     
                     sig_time = pos.get("signal_time") or pos.get("entry_time")
                     act_time = pos.get("action_time")
@@ -629,13 +746,25 @@ class ExecutionEngine:
                             reason
                         ])
 
-                    strat_info["cash"] = round(strat_info.get("cash", 10000.0) + net_pnl, 2)
-                    print(f"🎯 [TRADE CLOSED] {strat_name} ({direction} {ticker}) at ${exit_price} | Net PnL: ${net_pnl} | Reason: {reason} | Trigger Time: {ttt_str}")
+                    print(f"🎯 [TRADE CLOSED] {strat_name} ({direction} {ticker}) at ${exit_price} | Net PnL: ${net_pnl} | Return: ${returned_total} | New Cash: ${strat_info['cash']} | Trigger Time: {ttt_str}")
                 else:
                     remaining.append(pos)
 
             strat_info["positions"] = remaining
         self.portfolio_mgr.save()
+
+        # Auto-sync state back to GitHub repository in the background
+        if GITHUB_REPO and GITHUB_TOKEN:
+            threading.Thread(
+                target=sync_file_to_github,
+                args=(HISTORY_PATH, GITHUB_REPO, GITHUB_TOKEN, f"Auto-sync: closed {action_ticker} ({reason})"),
+                daemon=True
+            ).start()
+            threading.Thread(
+                target=sync_file_to_github,
+                args=(PORTFOLIO_PATH, GITHUB_REPO, GITHUB_TOKEN, f"Auto-sync: portfolio after {action_ticker}"),
+                daemon=True
+            ).start()
 
 # =====================================================================
 # Main Loop (Resource-Efficient 24/7 Engine)
@@ -643,7 +772,7 @@ class ExecutionEngine:
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    print("🚀 LagTrader Engine Running. Smart 24/7 Market Monitor Active.")
+    print("🚀 LagTrader Engine Running. Smart 24/7 Market Monitor & Webhook Active.")
 
     test_signal = {
         "strategy": "SKHY_ADR_FX_Neutralization",
@@ -663,7 +792,6 @@ if __name__ == "__main__":
     engine.process_signal(test_signal)
     engine.process_pending_queues()
 
-    # Checks pending queues and TP/SL every 60 seconds
     while True:
         try:
             engine.process_pending_queues()
