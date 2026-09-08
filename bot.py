@@ -29,12 +29,12 @@ HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.csv")
 
 HTTP_PORT = int(os.environ.get("PORT", 8080))
 
-# TwelveData API Key (fallback price provider)
+# TwelveData API Key
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "e5412639c4844ff8b877be3f53b69c9d")
 
-# GitHub Persistence Configuration (Optional: auto-commits trade history)
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "")    # format: "username/repository"
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")  # GitHub Personal Access Token
+# GitHub Persistence Configuration
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "wallstreetdibs/lagtrader")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 STRATEGY_ROSTER = [
     "ASX_ADR_Arbitrage", "US_Earnings_Lag", "Inventory_Drift_Reversal",
@@ -44,7 +44,9 @@ STRATEGY_ROSTER = [
     "Time_Zone_Momentum_Relay", "FX_Adjusted_Earnings_Arb", "Commodity_Proxy_Lag",
     "ETF_NAV_Window_Arb", "Nikkei_Tech_Relay", "London_Metals_Catchup",
     "Treasury_Shockwave", "Canadian_Energy_Echo", "ETF_Creation_Lag",
-    "SKHY_ADR_FX_Neutralization", "SKHY_HBM_Supply_Chain", "SKHY_Post_Market_KOSPI"
+    "SKHY_ADR_FX_Neutralization", "SKHY_HBM_Supply_Chain", "SKHY_Post_Market_KOSPI",
+    "TSMC_ADR_Arbitrage", "EUV_Lithography_Echo", "GLP1_Duopoly_Relay",
+    "Crypto_Weekend_Gap_Run", "SoftBank_ARM_Nexus"
 ]
 
 EXCHANGE_HOURS_UTC = {
@@ -53,20 +55,21 @@ EXCHANGE_HOURS_UTC = {
     "TSX": (13.5, 20.0),     # Toronto
     "XETR": (7.0, 15.5),     # Frankfurt
     "LSE": (7.0, 15.5),      # London
-    "OMX": (7.0, 15.0),      # Nordic / Copenhagen
-    "TSE": (0.0, 6.5),       # Tokyo (9:00 AM - 3:30 PM JST)
-    "KOSPI": (0.0, 6.5),     # Seoul (9:00 AM - 3:30 PM KST)
-    "ASX": (23.0, 6.0),      # Sydney (Opens 23:00 UTC Sunday to 06:00 UTC)
+    "AMS": (7.0, 15.5),      # Euronext Amsterdam (ASML)
+    "OMX": (7.0, 15.0),      # Nordic / Copenhagen (Novo Nordisk)
+    "TSE": (0.0, 6.5),       # Tokyo (SoftBank, Nikkei)
+    "KOSPI": (0.0, 6.5),     # Seoul (SK Hynix, Samsung)
+    "TWSE": (1.0, 5.5),      # Taiwan (TSMC 2330.TW)
+    "ASX": (23.0, 6.0),      # Sydney (BHP, Rio)
     "CME": (0.0, 24.0),      # Futures
     "CRYPTO": (0.0, 24.0)    # 24/7
 }
 
 # =====================================================================
-# GitHub Automatic State Persistence (Surviving Render Restarts)
+# GitHub Automatic State Persistence
 # =====================================================================
 
 def pull_file_from_github(file_path: str, repo: str, token: str):
-    """Downloads the latest file from GitHub on container boot if missing locally."""
     if not repo or not token:
         return False
     try:
@@ -94,7 +97,6 @@ def pull_file_from_github(file_path: str, repo: str, token: str):
     return False
 
 def sync_file_to_github(file_path: str, repo: str, token: str, commit_msg: str):
-    """Automatically commits state files back to GitHub so data is permanently safe."""
     if not repo or not token or not os.path.exists(file_path):
         return False
     try:
@@ -107,7 +109,6 @@ def sync_file_to_github(file_path: str, repo: str, token: str, commit_msg: str):
             "User-Agent": "LagTrader-Bot"
         }
 
-        # Check existing file SHA
         sha = None
         try:
             req = urllib.request.Request(api_url, headers=headers)
@@ -118,7 +119,6 @@ def sync_file_to_github(file_path: str, repo: str, token: str, commit_msg: str):
             if e.code != 404:
                 print(f"[GITHUB SYNC] Error looking up SHA: {e}")
 
-        # Base64 encode file content
         with open(file_path, "rb") as f:
             content_bytes = f.read()
         content_b64 = base64.b64encode(content_bytes).decode("utf-8")
@@ -142,29 +142,27 @@ def sync_file_to_github(file_path: str, repo: str, token: str, commit_msg: str):
 # =====================================================================
 
 def is_us_holiday(d: date) -> bool:
-    """Detects US market holidays where NYSE and NASDAQ are closed."""
     if d.month == 1 and d.day == 1:
-        return True  # New Year's Day
+        return True
     if d.month == 1 and d.weekday() == 0 and 15 <= d.day <= 21:
-        return True  # MLK Day
+        return True
     if d.month == 2 and d.weekday() == 0 and 15 <= d.day <= 21:
-        return True  # Presidents' Day
+        return True
     if d.month == 5 and d.weekday() == 0 and d.day >= 25:
-        return True  # Memorial Day
+        return True
     if d.month == 6 and d.day == 19:
-        return True  # Juneteenth
+        return True
     if d.month == 7 and d.day == 4:
-        return True  # Independence Day
+        return True
     if d.month == 9 and d.weekday() == 0 and 1 <= d.day <= 7:
-        return True  # Labor Day
+        return True
     if d.month == 11 and d.weekday() == 3 and 22 <= d.day <= 28:
-        return True  # Thanksgiving
+        return True
     if d.month == 12 and d.day == 25:
-        return True  # Christmas Day
+        return True
     return False
 
 def is_market_open(market_name: str, now: datetime = None) -> bool:
-    """Smart market schedule check (Timezones, Sunday Asian open, and Holidays)."""
     if now is None:
         now = datetime.now(timezone.utc)
     market = (market_name or "NYSE").upper()
@@ -175,11 +173,9 @@ def is_market_open(market_name: str, now: datetime = None) -> bool:
     weekday = now.weekday()
     utc_hour = now.hour + (now.minute / 60.0)
 
-    # Saturday: All global stock & futures exchanges closed
     if weekday == 5:
         return False
 
-    # Sunday:
     if weekday == 6:
         if market == "CME":
             return utc_hour >= 22.0
@@ -187,11 +183,9 @@ def is_market_open(market_name: str, now: datetime = None) -> bool:
             return utc_hour >= 23.0
         return False
 
-    # Friday CME pause at 21:00 UTC
     if weekday == 4 and market == "CME" and utc_hour >= 21.0:
         return False
 
-    # US Holiday Filter (e.g. Labor Day)
     if market in ["NYSE", "NASDAQ"] and is_us_holiday(now.date()):
         return False
 
@@ -205,11 +199,10 @@ def is_market_open(market_name: str, now: datetime = None) -> bool:
     return open_h <= utc_hour <= close_h
 
 # =====================================================================
-# Pricing Engine (Yahoo Finance with TwelveData Backup)
+# Pricing Engine
 # =====================================================================
 
 def fetch_twelvedata_price(ticker: str, api_key: str):
-    """Fallback price lookup via TwelveData API."""
     if not api_key:
         return None
     try:
@@ -227,7 +220,6 @@ def fetch_twelvedata_price(ticker: str, api_key: str):
     return None
 
 def fetch_live_price(ticker: str):
-    """Fetches real-time price using yfinance, falling back to TwelveData."""
     if not ticker:
         return None
 
@@ -260,7 +252,6 @@ def ensure_environment():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
-    # Restore from GitHub on boot if available
     if GITHUB_REPO and GITHUB_TOKEN:
         pull_file_from_github(PORTFOLIO_PATH, GITHUB_REPO, GITHUB_TOKEN)
         pull_file_from_github(HISTORY_PATH, GITHUB_REPO, GITHUB_TOKEN)
@@ -281,7 +272,7 @@ def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, b
     if direction_clean in ["BUY", "LONG"]:
         tp_price = round(entry_price * (1 + (expected_move_pct / 100.0)), 2)
         sl_price = round(entry_price - (1.5 * atr_14), 2)
-    else:  # SELL / SHORT
+    else:
         tp_price = round(entry_price * (1 - (expected_move_pct / 100.0)), 2)
         sl_price = round(entry_price + (1.5 * atr_14), 2)
         
@@ -306,7 +297,7 @@ def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
         return "N/A"
 
 # =====================================================================
-# Portfolio Manager
+# Portfolio Manager (29 Strategies / $290,000 Capital)
 # =====================================================================
 
 class PortfolioManager:
@@ -327,7 +318,7 @@ class PortfolioManager:
         return self._build_default_state()
 
     def _build_default_state(self):
-        state = {"total_capital": 240000.0, "strategies": {}}
+        state = {"total_capital": float(len(STRATEGY_ROSTER) * 10000.0), "strategies": {}}
         for strat in STRATEGY_ROSTER:
             state["strategies"][strat] = {"allocated": 10000.0, "cash": 10000.0, "positions": []}
         return state
@@ -338,6 +329,7 @@ class PortfolioManager:
         for strat in STRATEGY_ROSTER:
             if strat not in data["strategies"] or not isinstance(data["strategies"][strat], dict):
                 data["strategies"][strat] = {"allocated": 10000.0, "cash": 10000.0, "positions": []}
+        data["total_capital"] = float(len(STRATEGY_ROSTER) * 10000.0)
 
     def save(self):
         with self.lock:
@@ -424,7 +416,7 @@ class PortfolioManager:
                 "status": "online",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "kpi": {
-                    "total_capital": round(float(self.data.get("total_capital", 240000.0)), 2),
+                    "total_capital": round(float(self.data.get("total_capital", 290000.0)), 2),
                     "total_wins": total_wins,
                     "total_losses": total_losses,
                     "win_rate": overall_win_rate
@@ -437,7 +429,7 @@ class PortfolioManager:
             return {
                 "status": "online",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "kpi": {"total_capital": 240000.0, "total_wins": 0, "total_losses": 0, "win_rate": 0.0},
+                "kpi": {"total_capital": 290000.0, "total_wins": 0, "total_losses": 0, "win_rate": 0.0},
                 "orders": [],
                 "recent_trades": [],
                 "strategies": [{"name": s, "wins": 0, "losses": 0, "win_rate": 0.0, "allocated": 10000.0, "cash": 10000.0} for s in STRATEGY_ROSTER]
@@ -505,7 +497,6 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             self._send_json_response(500, {"status": "error", "message": str(e)})
 
     def do_POST(self):
-        """Webhook listener for incoming signals from TradingView, curl, or external bots."""
         try:
             parsed_path = self.path.split("?")[0]
             if parsed_path == "/api/signal":
@@ -554,7 +545,6 @@ class ExecutionEngine:
         start_server()
 
     def process_signal(self, signal_payload: dict):
-        """Processes incoming signal with strict Cash & Margin allocation."""
         strat_name = signal_payload.get("strategy")
         if not strat_name or strat_name not in STRATEGY_ROSTER:
             return False, f"Unknown or missing strategy '{strat_name}'"
@@ -577,7 +567,7 @@ class ExecutionEngine:
         direction = signal_payload.get("direction", "BUY").upper()
         qty = int(signal_payload.get("qty", 100))
 
-        # 1. Cash & Margin Check: Deduct capital on trade entry
+        # Cash & Margin Check
         required_capital = round(qty * entry_price, 2)
         strat_dict = self.portfolio_mgr.data["strategies"].setdefault(
             strat_name, {"allocated": 10000.0, "cash": 10000.0, "positions": []}
@@ -588,9 +578,7 @@ class ExecutionEngine:
             print(f"❌ [ORDER REJECTED] {strat_name}: Insufficient cash (Required: ${required_capital}, Available: ${available_cash})")
             return False, f"Insufficient cash: Required ${required_capital:.2f}, Available ${available_cash:.2f}"
 
-        # Deduct reserved cash
         strat_dict["cash"] = round(available_cash - required_capital, 2)
-
         tp, sl = calculate_dynamic_tp_sl(entry_price, discrepancy, beta, atr_14, direction)
 
         position_record = {
@@ -619,7 +607,6 @@ class ExecutionEngine:
         return True, f"Order {position_record['order_id']} placed successfully ({order_status})"
 
     def process_pending_queues(self):
-        """Activates queued orders when Action Market opens, updating entry price to real market open."""
         updated = False
         with self.portfolio_mgr.lock:
             for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
@@ -639,7 +626,6 @@ class ExecutionEngine:
                                 new_cost = round(real_open_price * pos["qty"], 2)
                                 cost_diff = round(new_cost - old_cost, 2)
                                 
-                                # Adjust cash for gap opening difference
                                 strat_info["cash"] = round(strat_info.get("cash", 0.0) - cost_diff, 2)
                                 pos["entry_price"] = real_open_price
                                 pos["invested_capital"] = new_cost
@@ -659,7 +645,6 @@ class ExecutionEngine:
             self.portfolio_mgr.save()
 
     def check_active_positions_tp_sl(self):
-        """Monitors open positions and exits when TP or SL is reached (only when exchange is open!)."""
         positions_to_close = []
 
         with self.portfolio_mgr.lock:
@@ -692,7 +677,7 @@ class ExecutionEngine:
                                 positions_to_close.append((strat_name, ticker, current_price, "TAKE_PROFIT"))
                             elif current_price <= sl:
                                 positions_to_close.append((strat_name, ticker, current_price, "STOP_LOSS"))
-                        else:  # SELL / SHORT
+                        else:
                             if current_price <= tp:
                                 positions_to_close.append((strat_name, ticker, current_price, "TAKE_PROFIT"))
                             elif current_price >= sl:
@@ -720,7 +705,6 @@ class ExecutionEngine:
                     fee = round(max(1.00, qty * 0.005), 2)
                     net_pnl = round(gross_pnl - fee, 2)
 
-                    # Return initial invested capital + profit/loss back to strategy cash
                     invested = pos.get("invested_capital", round(qty * entry_price, 2))
                     returned_total = round(invested + net_pnl, 2)
                     strat_info["cash"] = round(strat_info.get("cash", 0.0) + returned_total, 2)
@@ -753,7 +737,7 @@ class ExecutionEngine:
             strat_info["positions"] = remaining
         self.portfolio_mgr.save()
 
-        # Auto-sync state back to GitHub repository in the background
+        # Background GitHub Sync
         if GITHUB_REPO and GITHUB_TOKEN:
             threading.Thread(
                 target=sync_file_to_github,
@@ -772,7 +756,7 @@ class ExecutionEngine:
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    print("🚀 LagTrader Engine Running. Smart 24/7 Market Monitor & Webhook Active.")
+    print("🚀 LagTrader Engine Running (29 Models). Smart 24/7 Monitor & Webhook Active.")
 
     test_signal = {
         "strategy": "SKHY_ADR_FX_Neutralization",
