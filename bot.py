@@ -3,17 +3,12 @@ import sys
 import json
 import time
 import csv
+import io
 import zipfile
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 import pandas as pd
-
-try:
-    import gspread
-    GSPREAD_AVAILABLE = True
-except ImportError:
-    GSPREAD_AVAILABLE = False
 
 # =====================================================================
 # Configuration & Constants
@@ -23,10 +18,7 @@ DATA_DIR = "data"
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 PORTFOLIO_PATH = os.path.join(DATA_DIR, "portfolio_state.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.csv")
-GOOGLE_CREDENTIALS_PATH = "google_credentials.json"
-GOOGLE_SHEET_NAME = "LagTrader_Dashboard_Data"
 
-# Dynamically bind to host-provided PORT environment variable (e.g., Render) or fall back to 8080 locally
 HTTP_PORT = int(os.environ.get("PORT", 8080))
 
 STRATEGY_ROSTER = [
@@ -52,11 +44,10 @@ EXCHANGE_HOURS_UTC = {
 }
 
 # =====================================================================
-# Utilities & Dynamic Statistical Functions
+# Utilities
 # =====================================================================
 
 def ensure_environment():
-    """Ensure data storage directory, backup directory, and trade history CSV exist."""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
     if not os.path.exists(HISTORY_PATH):
@@ -68,103 +59,38 @@ def ensure_environment():
                 "trigger_time", "reason"
             ])
 
-def create_offline_backup():
-    """Generates timestamped zip archives of portfolio state and trade logs."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    backup_zip = os.path.join(BACKUP_DIR, f"lagtrader_backup_{timestamp}.zip")
-    
-    with zipfile.ZipFile(backup_zip, 'w') as zipf:
-        if os.path.exists(PORTFOLIO_PATH):
-            zipf.write(PORTFOLIO_PATH, arcname="portfolio_state.json")
-        if os.path.exists(HISTORY_PATH):
-            zipf.write(HISTORY_PATH, arcname="trade_history.csv")
-            
-    print(f"[BACKUP] Offline backup created: {backup_zip}")
-
 def is_market_open(market_name: str) -> bool:
-    """Checks whether the specified target market is currently open in UTC."""
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5 and market_name.upper() not in ["CME", "CRYPTO"]:
         return False
-    
     open_h, close_h = EXCHANGE_HOURS_UTC.get(market_name.upper(), (0.0, 24.0))
     if open_h == 0.0 and close_h == 24.0:
         return True
-    
     utc_hour = now.hour + (now.minute / 60.0)
     return open_h <= utc_hour <= close_h
 
 def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, beta: float = 1.0, atr_14: float = 0.50, direction: str = "BUY"):
-    """
-    Dynamic TP/SL engine:
-    TP = Entry +/- (Signal Discrepancy % * Beta * 0.80) to capture 80% of mean-reversion move.
-    SL = Entry -/+ (1.5 * ATR_14) to shield against noise.
-    """
     expected_move_pct = (signal_discrepancy_pct * beta) * 0.80
-    
     if direction.upper() == "BUY":
         tp_price = round(entry_price * (1 + (expected_move_pct / 100.0)), 2)
         sl_price = round(entry_price - (1.5 * atr_14), 2)
     else:
         tp_price = round(entry_price * (1 - (expected_move_pct / 100.0)), 2)
         sl_price = round(entry_price + (1.5 * atr_14), 2)
-        
     return tp_price, sl_price
 
 def format_trigger_time(signal_time_iso: str, action_time_iso: str = None) -> str:
-    """Calculates Pull the Trigger Time in human-readable hours/minutes/seconds."""
     t_sig = datetime.fromisoformat(signal_time_iso)
     t_act = datetime.fromisoformat(action_time_iso) if action_time_iso else datetime.now(timezone.utc)
-    
     elapsed_sec = int((t_act - t_sig).total_seconds())
     hours = elapsed_sec // 3600
     minutes = (elapsed_sec % 3600) // 60
     seconds = elapsed_sec % 60
-    
     if hours > 0:
         return f"{hours}h {minutes}m"
     elif minutes > 0:
         return f"{minutes}m {seconds}s"
     return f"{seconds}s"
-
-# =====================================================================
-# Embedded Health-Check Server (With CORS & Keep-Alive Support)
-# =====================================================================
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-        response = {"status": "online", "system": "LagTrader Engine", "timestamp": datetime.now(timezone.utc).isoformat()}
-        self.wfile.write(json.dumps(response).encode("utf-8"))
-
-    def do_HEAD(self):
-        """Handles HEAD requests sent by ping/monitoring services like UptimeRobot."""
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-    def do_OPTIONS(self):
-        """Handles CORS preflight checks sent by web browsers."""
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        return  # Suppress HTTP server stdout logs
-
-def start_health_check_server(port=HTTP_PORT):
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print(f"[SERVER] Health check endpoint listening on port {port} (/ping)")
 
 # =====================================================================
 # Portfolio Manager
@@ -173,6 +99,7 @@ def start_health_check_server(port=HTTP_PORT):
 class PortfolioManager:
     def __init__(self, filepath=PORTFOLIO_PATH):
         self.filepath = filepath
+        self.lock = threading.Lock()
         self.data = self.load()
 
     def load(self):
@@ -184,17 +111,12 @@ class PortfolioManager:
                     return data
             except Exception as e:
                 print(f"[WARN] Error reading portfolio JSON: {e}. Resetting.")
-        
         return self._build_default_state()
 
     def _build_default_state(self):
         state = {"total_capital": 240000.0, "strategies": {}}
         for strat in STRATEGY_ROSTER:
-            state["strategies"][strat] = {
-                "allocated": 10000.0,
-                "cash": 10000.0,
-                "positions": []
-            }
+            state["strategies"][strat] = {"allocated": 10000.0, "cash": 10000.0, "positions": []}
         return state
 
     def _reconcile_roster(self, data):
@@ -202,18 +124,14 @@ class PortfolioManager:
             data["strategies"] = {}
         for strat in STRATEGY_ROSTER:
             if strat not in data["strategies"]:
-                data["strategies"][strat] = {
-                    "allocated": 10000.0,
-                    "cash": 10000.0,
-                    "positions": []
-                }
+                data["strategies"][strat] = {"allocated": 10000.0, "cash": 10000.0, "positions": []}
 
     def save(self):
-        with open(self.filepath, "w") as f:
-            json.dump(self.data, f, indent=2)
+        with self.lock:
+            with open(self.filepath, "w") as f:
+                json.dump(self.data, f, indent=2)
 
     def get_strategy_stats(self):
-        """Computes true wins, losses, and win rates dynamically from trade_history.csv."""
         stats = {strat: {"wins": 0, "losses": 0, "win_rate": 0.0} for strat in STRATEGY_ROSTER}
         if os.path.exists(HISTORY_PATH):
             try:
@@ -229,72 +147,112 @@ class PortfolioManager:
                 print(f"[WARN] CSV parse failure for stats: {e}")
         return stats
 
-# =====================================================================
-# Google Sheets Synchronization
-# =====================================================================
+    def get_dashboard_payload(self):
+        """Generates real-time snapshot for the web dashboard."""
+        stats = self.get_strategy_stats()
+        total_wins = sum(s["wins"] for s in stats.values())
+        total_losses = sum(s["losses"] for s in stats.values())
+        total_trades = total_wins + total_losses
+        overall_win_rate = round((total_wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
 
-class GoogleSheetsSync:
-    def __init__(self, creds_path=GOOGLE_CREDENTIALS_PATH, sheet_name=GOOGLE_SHEET_NAME):
-        self.creds_path = creds_path
-        self.sheet_name = sheet_name
-
-    def sync(self, portfolio_mgr: PortfolioManager):
-        if not GSPREAD_AVAILABLE or not os.path.exists(self.creds_path):
-            return
-
-        try:
-            gc = gspread.service_account(filename=self.creds_path)
-            sh = gc.open(self.sheet_name)
-
-            # Tab 1: Orders and Queues
-            ws_orders = sh.worksheet("Orders") if "Orders" in [w.title for w in sh.worksheets()] else sh.sheet1
-            ws_orders.clear()
-            ws_orders.append_row([
-                "Status", "Strategy", "Signal Ticker", "Signal Market", 
-                "Action Ticker", "Action Market", "Side", "Qty", 
-                "Entry Price", "TP", "SL", "Signal Time", "Action Time", "Pull Trigger Time"
-            ])
-
-            for strat_name, strat in portfolio_mgr.data.get("strategies", {}).items():
+        all_orders = []
+        with self.lock:
+            for strat_name, strat in self.data.get("strategies", {}).items():
                 for pos in strat.get("positions", []):
-                    ws_orders.append_row([
-                        pos.get("status"),
-                        strat_name,
-                        pos.get("signal_ticker"),
-                        pos.get("signal_market"),
-                        pos.get("action_ticker"),
-                        pos.get("action_market"),
-                        pos.get("direction"),
-                        pos.get("qty"),
-                        pos.get("entry_price"),
-                        pos.get("tp_price"),
-                        pos.get("sl_price"),
-                        pos.get("signal_time"),
-                        pos.get("action_time", "Pending"),
-                        format_trigger_time(pos.get("signal_time"), pos.get("action_time"))
-                    ])
+                    pos_copy = dict(pos)
+                    pos_copy["pull_trigger_time"] = format_trigger_time(pos.get("signal_time"), pos.get("action_time"))
+                    all_orders.append(pos_copy)
 
-            # Tab 2: Strategy Stats & Wins/Losses
-            if "Strategy_Stats" in [w.title for w in sh.worksheets()]:
-                ws_stats = sh.worksheet("Strategy_Stats")
-                ws_stats.clear()
-                ws_stats.append_row(["Strategy", "Wins", "Losses", "Win Rate (%)", "Allocated", "Cash"])
-                
-                stats = portfolio_mgr.get_strategy_stats()
-                for strat_name in STRATEGY_ROSTER:
-                    s_info = portfolio_mgr.data["strategies"].get(strat_name, {})
-                    s_stat = stats.get(strat_name, {"wins": 0, "losses": 0, "win_rate": 0.0})
-                    ws_stats.append_row([
-                        strat_name,
-                        s_stat["wins"],
-                        s_stat["losses"],
-                        f"{s_stat['win_rate']}%",
-                        s_info.get("allocated", 10000.0),
-                        s_info.get("cash", 10000.0)
-                    ])
+        return {
+            "status": "online",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kpi": {
+                "total_capital": self.data.get("total_capital", 240000.0),
+                "total_wins": total_wins,
+                "total_losses": total_losses,
+                "win_rate": overall_win_rate
+            },
+            "orders": all_orders,
+            "strategies": [
+                {
+                    "name": s,
+                    "wins": stats[s]["wins"],
+                    "losses": stats[s]["losses"],
+                    "win_rate": stats[s]["win_rate"],
+                    "allocated": self.data["strategies"].get(s, {}).get("allocated", 10000.0),
+                    "cash": self.data["strategies"].get(s, {}).get("cash", 10000.0)
+                }
+                for s in STRATEGY_ROSTER
+            ]
+        }
 
-        except Exception as e:
-            print(f"[ERROR] Google Sheets Sync Error: {e}")
+# =====================================================================
+# Web API & Health-Check Server (For Dashboard & UptimeRobot)
+# =====================================================================
+
+ENGINE_INSTANCE = None
+
+class DashboardAPIHandler(BaseHTTPRequestHandler):
+    def _send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._send_cors_headers()
+        self.end_headers()
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "application/json")
+        self._send_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/api/data":
+            # Live dashboard data feed
+            if ENGINE_INSTANCE:
+                payload = ENGINE_INSTANCE.portfolio_mgr.get_dashboard_payload()
+            else:
+                payload = {"status": "starting"}
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+        elif self.path == "/api/backup":
+            # Direct CSV download in browser for instant offline backup
+            if os.path.exists(HISTORY_PATH):
+                self.send_response(200)
+                self.send_header("Content-type", "text/csv")
+                self.send_header("Content-Disposition", "attachment; filename=trade_history.csv")
+                self._send_cors_headers()
+                self.end_headers()
+                with open(HISTORY_PATH, "rb") as f:
+                    self.wfile.write(f.read())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        else:
+            # Root ping endpoint for UptimeRobot
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self._send_cors_headers()
+            self.end_headers()
+            response = {"status": "online", "system": "LagTrader Engine", "timestamp": datetime.now(timezone.utc).isoformat()}
+            self.wfile.write(json.dumps(response).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        return
+
+def start_server(port=HTTP_PORT):
+    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardAPIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[SERVER] Listening on port {port} (/api/data & /)")
 
 # =====================================================================
 # Execution Engine
@@ -302,13 +260,13 @@ class GoogleSheetsSync:
 
 class ExecutionEngine:
     def __init__(self):
+        global ENGINE_INSTANCE
         ensure_environment()
         self.portfolio_mgr = PortfolioManager()
-        self.gsheet_sync = GoogleSheetsSync()
-        start_health_check_server()
+        ENGINE_INSTANCE = self
+        start_server()
 
     def process_signal(self, signal_payload: dict):
-        """Processes incoming catalyst signals, determines queueing, and calculates dynamic TP/SL."""
         signal_time = signal_payload.get("signal_time", datetime.now(timezone.utc).isoformat())
         strat_name = signal_payload["strategy"]
         action_market = signal_payload.get("action_market", "NYSE")
@@ -346,86 +304,79 @@ class ExecutionEngine:
             strat_name, {"allocated": 10000.0, "cash": 10000.0, "positions": []}
         )
         strat_dict["positions"].append(position_record)
-        
         self.portfolio_mgr.save()
-        self.gsheet_sync.sync(self.portfolio_mgr)
 
         ttt_str = format_trigger_time(signal_time, action_time)
         print(f"[{order_status}] Strategy: {strat_name} | Action: {position_record['action_ticker']} | TP: {tp} | SL: {sl} | Trigger Time: {ttt_str}")
 
     def process_pending_queues(self):
-        """Scans queued market open orders and activates them when exchange opens."""
         updated = False
-        for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
-            for pos in strat_info.get("positions", []):
-                if pos.get("status") == "PENDING_MARKET_OPEN":
-                    if is_market_open(pos.get("action_market", "NYSE")):
-                        pos["status"] = "ACTIVE"
-                        pos["action_time"] = datetime.now(timezone.utc).isoformat()
-                        updated = True
-                        ttt_str = format_trigger_time(pos["signal_time"], pos["action_time"])
-                        print(f"[MARKET OPENED] Activated order for {pos['action_ticker']}. Pull Trigger Time: {ttt_str}")
+        with self.portfolio_mgr.lock:
+            for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
+                for pos in strat_info.get("positions", []):
+                    if pos.get("status") == "PENDING_MARKET_OPEN":
+                        if is_market_open(pos.get("action_market", "NYSE")):
+                            pos["status"] = "ACTIVE"
+                            pos["action_time"] = datetime.now(timezone.utc).isoformat()
+                            updated = True
+                            ttt_str = format_trigger_time(pos["signal_time"], pos["action_time"])
+                            print(f"[MARKET OPENED] Activated order for {pos['action_ticker']}. Pull Trigger Time: {ttt_str}")
 
         if updated:
             self.portfolio_mgr.save()
-            self.gsheet_sync.sync(self.portfolio_mgr)
 
     def close_position(self, strat_name: str, action_ticker: str, exit_price: float, reason: str = "TAKE_PROFIT"):
-        """Closes active position and updates trade_history.csv with real PnL."""
         strat_info = self.portfolio_mgr.data["strategies"].get(strat_name)
         if not strat_info:
             return
 
         remaining = []
-        for pos in strat_info.get("positions", []):
-            if pos["action_ticker"] == action_ticker and pos["status"] == "ACTIVE":
-                qty = pos["qty"]
-                entry_price = pos["entry_price"]
-                direction = pos.get("direction", "BUY")
+        with self.portfolio_mgr.lock:
+            for pos in strat_info.get("positions", []):
+                if pos["action_ticker"] == action_ticker and pos["status"] == "ACTIVE":
+                    qty = pos["qty"]
+                    entry_price = pos["entry_price"]
+                    direction = pos.get("direction", "BUY")
 
-                multiplier = 1 if direction == "BUY" else -1
-                gross_pnl = round((exit_price - entry_price) * qty * multiplier, 2)
-                fee = round(max(1.00, qty * 0.005), 2)
-                net_pnl = round(gross_pnl - fee, 2)
+                    multiplier = 1 if direction == "BUY" else -1
+                    gross_pnl = round((exit_price - entry_price) * qty * multiplier, 2)
+                    fee = round(max(1.00, qty * 0.005), 2)
+                    net_pnl = round(gross_pnl - fee, 2)
+                    ttt_str = format_trigger_time(pos["signal_time"], pos["action_time"])
 
-                ttt_str = format_trigger_time(pos["signal_time"], pos["action_time"])
+                    with open(HISTORY_PATH, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            datetime.now(timezone.utc).isoformat(),
+                            strat_name,
+                            pos.get("signal_ticker"),
+                            pos.get("action_ticker"),
+                            f"CLOSE_{direction}",
+                            qty,
+                            exit_price,
+                            gross_pnl,
+                            fee,
+                            net_pnl,
+                            ttt_str,
+                            reason
+                        ])
 
-                with open(HISTORY_PATH, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        datetime.now(timezone.utc).isoformat(),
-                        strat_name,
-                        pos.get("signal_ticker"),
-                        pos.get("action_ticker"),
-                        f"CLOSE_{direction}",
-                        qty,
-                        exit_price,
-                        gross_pnl,
-                        fee,
-                        net_pnl,
-                        ttt_str,
-                        reason
-                    ])
+                    strat_info["cash"] = round(strat_info["cash"] + net_pnl, 2)
+                    print(f"[CLOSED TRADE] {strat_name} ({action_ticker}) | Net PnL: ${net_pnl} | Reason: {reason}")
+                else:
+                    remaining.append(pos)
 
-                strat_info["cash"] = round(strat_info["cash"] + net_pnl, 2)
-                print(f"[CLOSED TRADE] {strat_name} ({action_ticker}) | Net PnL: ${net_pnl} | Reason: {reason}")
-            else:
-                remaining.append(pos)
-
-        strat_info["positions"] = remaining
+            strat_info["positions"] = remaining
         self.portfolio_mgr.save()
-        self.gsheet_sync.sync(self.portfolio_mgr)
 
 # =====================================================================
-# Main Loop Execution (24/7 Service Runtime)
+# Main Loop
 # =====================================================================
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    create_offline_backup()
-    print("🚀 LagTrader Engine Running. Monitoring signals and market hours...")
+    print("🚀 LagTrader Engine Running with Live API...")
 
-    # Simulated Incoming Signal Example
     test_signal = {
         "strategy": "SKHY_ADR_FX_Neutralization",
         "signal_ticker": "000660.KS",
@@ -444,7 +395,6 @@ if __name__ == "__main__":
     engine.process_signal(test_signal)
     engine.process_pending_queues()
 
-    # Continuous background polling loop to keep service active on hosting platforms
     while True:
         time.sleep(60)
         engine.process_pending_queues()
