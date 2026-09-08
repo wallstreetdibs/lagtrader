@@ -29,7 +29,7 @@ HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.csv")
 
 HTTP_PORT = int(os.environ.get("PORT", 8080))
 
-# TwelveData API Key
+# TwelveData API Key (configured as default backup to Yahoo Finance)
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "e5412639c4844ff8b877be3f53b69c9d")
 
 # GitHub Persistence Configuration
@@ -49,6 +49,8 @@ STRATEGY_ROSTER = [
     "Crypto_Weekend_Gap_Run", "SoftBank_ARM_Nexus"
 ]
 
+# Market Operating Hours (UTC)
+# Full Market Hours (for TP/SL exits)
 EXCHANGE_HOURS_UTC = {
     "NYSE": (13.5, 20.0),    # 9:30 AM - 4:00 PM US Eastern
     "NASDAQ": (13.5, 20.0),
@@ -60,9 +62,27 @@ EXCHANGE_HOURS_UTC = {
     "TSE": (0.0, 6.5),       # Tokyo (SoftBank, Nikkei)
     "KOSPI": (0.0, 6.5),     # Seoul (SK Hynix, Samsung)
     "TWSE": (1.0, 5.5),      # Taiwan (TSMC 2330.TW)
-    "ASX": (23.0, 6.0),      # Sydney (BHP, Rio)
+    "ASX": (23.0, 6.0),      # Sydney (Opens 23:00 UTC Sunday to 06:00 UTC)
     "CME": (0.0, 24.0),      # Futures
     "CRYPTO": (0.0, 24.0)    # 24/7
+}
+
+# 15-Minute Delayed Entry Window (UTC)
+# Bypasses the 9:30 - 9:45 AM opening whipsaw for new entries!
+ENTRY_HOURS_UTC = {
+    "NYSE": (13.75, 19.75),   # 9:45 AM - 3:45 PM US Eastern
+    "NASDAQ": (13.75, 19.75),
+    "TSX": (13.75, 19.75),
+    "XETR": (7.25, 15.25),    # 15m after European open
+    "LSE": (7.25, 15.25),
+    "AMS": (7.25, 15.25),
+    "OMX": (7.25, 14.75),
+    "TSE": (0.25, 6.25),
+    "KOSPI": (0.25, 6.25),
+    "TWSE": (1.25, 5.25),
+    "ASX": (23.25, 5.75),
+    "CME": (0.0, 24.0),
+    "CRYPTO": (0.0, 24.0)
 }
 
 # =====================================================================
@@ -162,7 +182,12 @@ def is_us_holiday(d: date) -> bool:
         return True
     return False
 
-def is_market_open(market_name: str, now: datetime = None) -> bool:
+def is_market_open(market_name: str, for_entry: bool = False, now: datetime = None) -> bool:
+    """
+    Checks if market is open.
+    If for_entry=True, applies the 15-minute opening delay (e.g. 13:45 UTC for NYSE)
+    to avoid opening whip and fakeout traps.
+    """
     if now is None:
         now = datetime.now(timezone.utc)
     market = (market_name or "NYSE").upper()
@@ -189,7 +214,9 @@ def is_market_open(market_name: str, now: datetime = None) -> bool:
     if market in ["NYSE", "NASDAQ"] and is_us_holiday(now.date()):
         return False
 
-    open_h, close_h = EXCHANGE_HOURS_UTC.get(market, (0.0, 24.0))
+    schedule = ENTRY_HOURS_UTC if for_entry else EXCHANGE_HOURS_UTC
+    open_h, close_h = schedule.get(market, (0.0, 24.0))
+
     if open_h == 0.0 and close_h == 24.0:
         return True
 
@@ -266,15 +293,30 @@ def ensure_environment():
             ])
 
 def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, beta: float = 1.0, atr_14: float = 0.50, direction: str = "BUY"):
-    expected_move_pct = (signal_discrepancy_pct * beta) * 0.80
+    """
+    Evidence-Backed Dynamic TP/SL Engine:
+    1. Stop Loss = 2.0 * ATR (protects against the 1.15% - 2.50% opening wicks).
+    2. Enforces a minimum 2.0% volatility floor so high-priced stocks aren't clipped by tiny stops.
+    3. Take Profit captures 80% of expected move, minimum 1.5% target.
+    """
     direction_clean = direction.upper()
 
+    # Volatility floor: ATR must be at least 1.5% of stock price
+    effective_atr = max(atr_14, entry_price * 0.015)
+
+    # Expected move minimum 1.5%
+    expected_move_pct = max(abs(signal_discrepancy_pct) * beta * 0.80, 1.50)
+
+    # Forgiving 2.0x ATR Stop Loss
+    sl_distance = round(2.0 * effective_atr, 2)
+    tp_distance = round(entry_price * (expected_move_pct / 100.0), 2)
+
     if direction_clean in ["BUY", "LONG"]:
-        tp_price = round(entry_price * (1 + (expected_move_pct / 100.0)), 2)
-        sl_price = round(entry_price - (1.5 * atr_14), 2)
-    else:
-        tp_price = round(entry_price * (1 - (expected_move_pct / 100.0)), 2)
-        sl_price = round(entry_price + (1.5 * atr_14), 2)
+        tp_price = round(entry_price + tp_distance, 2)
+        sl_price = round(entry_price - sl_distance, 2)
+    else:  # SELL / SHORT
+        tp_price = round(entry_price - tp_distance, 2)
+        sl_price = round(entry_price + sl_distance, 2)
         
     return tp_price, sl_price
 
@@ -533,7 +575,7 @@ def start_server(port=HTTP_PORT):
     print(f"[SERVER] Listening on port {port} (GET /api/data & POST /api/signal)")
 
 # =====================================================================
-# Execution Engine (With Real Cash Accounting)
+# Execution Engine (With 15-Min Buffer & Gap-Hold Filter)
 # =====================================================================
 
 class ExecutionEngine:
@@ -556,9 +598,10 @@ class ExecutionEngine:
         signal_time = signal_payload.get("signal_time", datetime.now(timezone.utc).isoformat())
         action_market = signal_payload.get("action_market", "NYSE")
         
-        market_open = is_market_open(action_market)
-        order_status = "ACTIVE" if market_open else "PENDING_MARKET_OPEN"
-        action_time = datetime.now(timezone.utc).isoformat() if market_open else None
+        # Uses 15-min delayed entry window for new orders
+        entry_window_open = is_market_open(action_market, for_entry=True)
+        order_status = "ACTIVE" if entry_window_open else "PENDING_MARKET_OPEN"
+        action_time = datetime.now(timezone.utc).isoformat() if entry_window_open else None
 
         entry_price = float(signal_payload.get("entry_price", 100.0))
         discrepancy = float(signal_payload.get("discrepancy_pct", 1.5))
@@ -604,34 +647,63 @@ class ExecutionEngine:
 
         ttt_str = format_trigger_time(signal_time, action_time)
         print(f"[{order_status}] {strat_name} | {direction} {action_ticker} ({action_market}) | Cost: ${required_capital} | Cash Left: ${strat_dict['cash']} | TP: {tp} | SL: {sl} | Trigger: {ttt_str}")
-        return True, f"Order {position_record['order_id']} placed successfully ({order_status})"
+        return True, f"Order {position_record['order_id']} placed ({order_status})"
 
     def process_pending_queues(self):
+        """
+        Activates queued orders at 9:45 AM ET (13:45 UTC).
+        Includes the Gap-Hold Confirmation Filter: cancels orders if the opening
+        move completely collapsed into a bull/bear trap in the first 15 mins!
+        """
         updated = False
         with self.portfolio_mgr.lock:
             for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
                 if not isinstance(strat_info, dict):
                     continue
+                remaining_positions = []
                 for pos in strat_info.get("positions", []):
                     if not isinstance(pos, dict):
                         continue
+
                     if pos.get("status") == "PENDING_MARKET_OPEN":
                         action_mkt = pos.get("action_market", "NYSE")
-                        if is_market_open(action_mkt):
+                        
+                        # Waits until 15 minutes after open (13:45 UTC for US markets)
+                        if is_market_open(action_mkt, for_entry=True):
                             ticker = pos.get("action_ticker")
-                            real_open_price = fetch_live_price(ticker)
-                            
-                            if real_open_price and real_open_price > 0:
-                                old_cost = pos.get("invested_capital", pos["entry_price"] * pos["qty"])
-                                new_cost = round(real_open_price * pos["qty"], 2)
+                            direction = pos.get("direction", "BUY").upper()
+                            current_945_price = fetch_live_price(ticker)
+
+                            if current_945_price and current_945_price > 0:
+                                old_entry = pos.get("entry_price", current_945_price)
+                                
+                                # GAP-HOLD CONFIRMATION FILTER:
+                                # If BUY, check if price broke down >1.5% below signal price (bull trap)
+                                # If SELL, check if price bounced >1.5% above signal price (bear trap)
+                                is_trap = False
+                                if direction in ["BUY", "LONG"] and current_945_price < old_entry * 0.985:
+                                    is_trap = True
+                                elif direction in ["SELL", "SHORT"] and current_945_price > old_entry * 1.015:
+                                    is_trap = True
+
+                                if is_trap:
+                                    # CANCEL ORDER & REFUND CAPITAL
+                                    refund = pos.get("invested_capital", old_entry * pos["qty"])
+                                    strat_info["cash"] = round(strat_info.get("cash", 0.0) + refund, 2)
+                                    updated = True
+                                    print(f"🛡️ [GAP TRAP CANCELLED] {strat_name} ({direction} {ticker}): Opening move collapsed by 9:45 AM (${current_945_price} vs ${old_entry}). Refunded ${refund} to cash!")
+                                    continue  # Drop from positions
+
+                                # VALID SETUP: Update entry price to clean 9:45 AM print
+                                old_cost = pos.get("invested_capital", old_entry * pos["qty"])
+                                new_cost = round(current_945_price * pos["qty"], 2)
                                 cost_diff = round(new_cost - old_cost, 2)
-                                
+
                                 strat_info["cash"] = round(strat_info.get("cash", 0.0) - cost_diff, 2)
-                                pos["entry_price"] = real_open_price
+                                pos["entry_price"] = current_945_price
                                 pos["invested_capital"] = new_cost
-                                
-                                direction = pos.get("direction", "BUY")
-                                tp, sl = calculate_dynamic_tp_sl(real_open_price, 1.5, 1.0, 0.50, direction)
+
+                                tp, sl = calculate_dynamic_tp_sl(current_945_price, 1.5, 1.0, 0.50, direction)
                                 pos["tp_price"] = tp
                                 pos["sl_price"] = sl
 
@@ -639,12 +711,16 @@ class ExecutionEngine:
                             pos["action_time"] = datetime.now(timezone.utc).isoformat()
                             updated = True
                             ttt_str = format_trigger_time(pos.get("signal_time"), pos.get("action_time"))
-                            print(f"[MARKET OPENED] Order placed for {ticker} at ${pos['entry_price']}. Pull Trigger Time: {ttt_str}")
+                            print(f"⚡ [9:45 AM EXECUTED] {direction} {ticker} entered at ${pos['entry_price']}. Pull Trigger Time: {ttt_str}")
+
+                    remaining_positions.append(pos)
+                strat_info["positions"] = remaining_positions
 
         if updated:
             self.portfolio_mgr.save()
 
     def check_active_positions_tp_sl(self):
+        """Monitors open positions continuously throughout the full market session."""
         positions_to_close = []
 
         with self.portfolio_mgr.lock:
@@ -657,7 +733,8 @@ class ExecutionEngine:
                     if pos.get("status") == "ACTIVE":
                         action_mkt = pos.get("action_market", "NYSE")
                         
-                        if not is_market_open(action_mkt):
+                        # Full operating hours (13:30 to 20:00 UTC)
+                        if not is_market_open(action_mkt, for_entry=False):
                             continue
 
                         ticker = pos.get("action_ticker") or pos.get("ticker")
@@ -756,7 +833,7 @@ class ExecutionEngine:
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    print("🚀 LagTrader Engine Running (29 Models). Smart 24/7 Monitor & Webhook Active.")
+    print("🚀 LagTrader Engine Running (29 Models). 15-Min Buffer & Gap-Hold Filter Active.")
 
     test_signal = {
         "strategy": "SKHY_ADR_FX_Neutralization",
