@@ -5,6 +5,8 @@ import time
 import csv
 import zipfile
 import threading
+import urllib.request
+import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, date
 import pandas as pd
@@ -24,7 +26,11 @@ BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 PORTFOLIO_PATH = os.path.join(DATA_DIR, "portfolio_state.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.csv")
 
+# Port dynamically assigned by Render or defaults to 8080
 HTTP_PORT = int(os.environ.get("PORT", 8080))
+
+# TwelveData API Key (configured as default backup to Yahoo Finance)
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "e5412639c4844ff8b877be3f53b69c9d")
 
 STRATEGY_ROSTER = [
     "ASX_ADR_Arbitrage", "US_Earnings_Lag", "Inventory_Drift_Reversal",
@@ -38,7 +44,7 @@ STRATEGY_ROSTER = [
 ]
 
 EXCHANGE_HOURS_UTC = {
-    "NYSE": (13.5, 20.0),    # 9:30 AM - 4:00 PM US ET
+    "NYSE": (13.5, 20.0),    # 9:30 AM - 4:00 PM US Eastern
     "NASDAQ": (13.5, 20.0),
     "TSX": (13.5, 20.0),     # Toronto
     "XETR": (7.0, 15.5),     # Frankfurt
@@ -46,78 +52,68 @@ EXCHANGE_HOURS_UTC = {
     "OMX": (7.0, 15.0),      # Nordic / Copenhagen
     "TSE": (0.0, 6.5),       # Tokyo (9:00 AM - 3:30 PM JST)
     "KOSPI": (0.0, 6.5),     # Seoul (9:00 AM - 3:30 PM KST)
-    "ASX": (23.0, 6.0),      # Sydney (opens 23:00 UTC previous day to 06:00 UTC)
+    "ASX": (23.0, 6.0),      # Sydney (Opens 23:00 UTC Sunday to 06:00 UTC)
     "CME": (0.0, 24.0),      # Futures
     "CRYPTO": (0.0, 24.0)    # 24/7
 }
 
 # =====================================================================
-# Market Calendar & Holiday Intelligence
+# Market Calendar & US Holiday Intelligence
 # =====================================================================
 
 def is_us_holiday(d: date) -> bool:
-    """Calculates major US market holidays where NYSE/NASDAQ are closed."""
-    # New Year's Day (Jan 1)
+    """Detects US market holidays where NYSE and NASDAQ are closed."""
     if d.month == 1 and d.day == 1:
-        return True
-    # MLK Day: 3rd Monday in January
+        return True  # New Year's Day
     if d.month == 1 and d.weekday() == 0 and 15 <= d.day <= 21:
-        return True
-    # Presidents' Day: 3rd Monday in February
+        return True  # MLK Day (3rd Monday in Jan)
     if d.month == 2 and d.weekday() == 0 and 15 <= d.day <= 21:
-        return True
-    # Memorial Day: Last Monday in May
+        return True  # Presidents' Day (3rd Monday in Feb)
     if d.month == 5 and d.weekday() == 0 and d.day >= 25:
-        return True
-    # Juneteenth: June 19
+        return True  # Memorial Day (Last Monday in May)
     if d.month == 6 and d.day == 19:
-        return True
-    # Independence Day: July 4
+        return True  # Juneteenth
     if d.month == 7 and d.day == 4:
-        return True
-    # Labor Day: 1st Monday in September (e.g. today, Sept 7, 2026!)
+        return True  # Independence Day
     if d.month == 9 and d.weekday() == 0 and 1 <= d.day <= 7:
-        return True
-    # Thanksgiving: 4th Thursday in November
+        return True  # Labor Day (1st Monday in Sept)
     if d.month == 11 and d.weekday() == 3 and 22 <= d.day <= 28:
-        return True
-    # Christmas Day: Dec 25
+        return True  # Thanksgiving (4th Thursday in Nov)
     if d.month == 12 and d.day == 25:
-        return True
+        return True  # Christmas Day
     return False
 
 def is_market_open(market_name: str, now: datetime = None) -> bool:
-    """Smart market open check that handles timezones, Sunday Asian open, and holidays."""
+    """Smart market schedule check (Timezones, Sunday Asian open, and Holidays)."""
     if now is None:
         now = datetime.now(timezone.utc)
-    market = market_name.upper()
+    market = (market_name or "NYSE").upper()
 
     if market == "CRYPTO":
         return True
 
-    weekday = now.weekday()  # 0 = Monday, ..., 5 = Saturday, 6 = Sunday
+    weekday = now.weekday()  # 0 = Mon, 4 = Fri, 5 = Sat, 6 = Sun
     utc_hour = now.hour + (now.minute / 60.0)
 
-    # Saturday: All equity & futures markets are closed worldwide
+    # Saturday: All global stock & futures exchanges closed
     if weekday == 5:
         return False
 
     # Sunday:
     if weekday == 6:
-        # CME futures open Sunday at 22:00 UTC (6:00 PM ET)
+        # CME futures open Sunday at 22:00 UTC (6:00 PM US Eastern)
         if market == "CME":
             return utc_hour >= 22.0
-        # ASX (Australia) opens Sunday at 23:00 UTC (Monday 9:00 AM Sydney)
+        # Australia (ASX) opens Sunday at 23:00 UTC (Monday 9:00 AM Sydney)
         if market == "ASX":
             return utc_hour >= 23.0
-        # All other stock markets are closed on Sunday
         return False
 
-    # Friday closing: CME futures pause Friday at 21:00 UTC
+    # Friday CME pause at 21:00 UTC
     if weekday == 4 and market == "CME" and utc_hour >= 21.0:
         return False
 
-    # US market holiday check
+    # US Holiday Filter (e.g. Labor Day)
     if market in ["NYSE", "NASDAQ"] and is_us_holiday(now.date()):
         return False
 
@@ -126,10 +122,60 @@ def is_market_open(market_name: str, now: datetime = None) -> bool:
         return True
 
     if open_h > close_h:
-        # Crosses midnight UTC (like ASX: 23:00 to 06:00 UTC)
+        # Overnight UTC session (e.g. ASX: 23:00 to 06:00 UTC)
         return utc_hour >= open_h or utc_hour <= close_h
 
     return open_h <= utc_hour <= close_h
+
+# =====================================================================
+# Pricing Engine (Yahoo Finance with TwelveData Backup)
+# =====================================================================
+
+def fetch_twelvedata_price(ticker: str, api_key: str):
+    """Fallback price lookup via TwelveData API."""
+    if not api_key:
+        return None
+    try:
+        clean_sym = ticker.split(".")[0]
+        url = f"https://api.twelvedata.com/price?symbol={clean_sym}&apikey={api_key}"
+        req = urllib.request.Request(url, headers={"User-Agent": "LagTrader/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if "price" in data:
+                val = float(data["price"])
+                if val > 0:
+                    return round(val, 2)
+    except Exception:
+        pass
+    return None
+
+def fetch_live_price(ticker: str):
+    """Fetches real-time price using yfinance, falling back to TwelveData."""
+    if not ticker:
+        return None
+
+    # 1. Primary: yfinance fast_info (ultra-low memory & fast)
+    if YFINANCE_AVAILABLE:
+        try:
+            t = yf.Ticker(ticker)
+            price = t.fast_info.get("last_price")
+            if price is not None and not pd.isna(price) and price > 0:
+                return round(float(price), 2)
+            hist = t.history(period="1d", interval="1m")
+            if not hist.empty and "Close" in hist:
+                last_val = hist["Close"].iloc[-1]
+                if not pd.isna(last_val) and last_val > 0:
+                    return round(float(last_val), 2)
+        except Exception:
+            pass
+
+    # 2. Backup: TwelveData API
+    if TWELVEDATA_API_KEY:
+        td_price = fetch_twelvedata_price(ticker, TWELVEDATA_API_KEY)
+        if td_price is not None and td_price > 0:
+            return td_price
+
+    return None
 
 # =====================================================================
 # Utilities
@@ -148,13 +194,21 @@ def ensure_environment():
             ])
 
 def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, beta: float = 1.0, atr_14: float = 0.50, direction: str = "BUY"):
+    """
+    Dynamic TP/SL engine for both LONG and SHORT:
+    BUY:  TP = Entry + Target Move, SL = Entry - (1.5 * ATR)
+    SELL: TP = Entry - Target Move, SL = Entry + (1.5 * ATR)
+    """
     expected_move_pct = (signal_discrepancy_pct * beta) * 0.80
-    if direction.upper() == "BUY":
+    direction_clean = direction.upper()
+
+    if direction_clean in ["BUY", "LONG"]:
         tp_price = round(entry_price * (1 + (expected_move_pct / 100.0)), 2)
         sl_price = round(entry_price - (1.5 * atr_14), 2)
-    else:
+    else:  # SELL / SHORT
         tp_price = round(entry_price * (1 - (expected_move_pct / 100.0)), 2)
         sl_price = round(entry_price + (1.5 * atr_14), 2)
+        
     return tp_price, sl_price
 
 def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
@@ -175,26 +229,6 @@ def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
         return f"{seconds}s"
     except Exception:
         return "N/A"
-
-def fetch_live_price(ticker: str):
-    """Ultra-lightweight price fetcher using yfinance fast_info (minimal RAM/CPU)."""
-    if not YFINANCE_AVAILABLE:
-        return None
-    try:
-        t = yf.Ticker(ticker)
-        # fast_info only retrieves the latest quote without downloading historical tables
-        price = t.fast_info.get("last_price")
-        if price is not None and not pd.isna(price) and price > 0:
-            return round(float(price), 2)
-        # Fallback to single 1-minute candle
-        hist = t.history(period="1d", interval="1m")
-        if not hist.empty and "Close" in hist:
-            last_val = hist["Close"].iloc[-1]
-            if not pd.isna(last_val) and last_val > 0:
-                return round(float(last_val), 2)
-    except Exception:
-        pass
-    return None
 
 # =====================================================================
 # Portfolio Manager
@@ -273,6 +307,8 @@ class PortfolioManager:
                         pos_copy["status"] = pos.get("status", "ACTIVE")
                         pos_copy["action_ticker"] = pos.get("action_ticker") or pos.get("ticker", "UNKNOWN")
                         pos_copy["action_market"] = pos.get("action_market", "NYSE")
+                        pos_copy["signal_ticker"] = pos.get("signal_ticker", "-")
+                        pos_copy["signal_market"] = pos.get("signal_market", "-")
                         pos_copy["direction"] = pos.get("direction", "BUY")
                         pos_copy["qty"] = pos.get("qty", 100)
                         pos_copy["entry_price"] = round(float(pos.get("entry_price", 0.0)), 2)
@@ -299,6 +335,17 @@ class PortfolioManager:
                     "cash": round(float(cash), 2)
                 })
 
+            # Load last 5 completed trades for dashboard
+            recent_trades = []
+            if os.path.exists(HISTORY_PATH):
+                try:
+                    df = pd.read_csv(HISTORY_PATH)
+                    if not df.empty:
+                        recent_trades = df.tail(5).to_dict(orient="records")
+                        recent_trades.reverse()
+                except Exception:
+                    pass
+
             return {
                 "status": "online",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -309,6 +356,7 @@ class PortfolioManager:
                     "win_rate": overall_win_rate
                 },
                 "orders": all_orders,
+                "recent_trades": recent_trades,
                 "strategies": strat_list
             }
         except Exception as e:
@@ -317,6 +365,7 @@ class PortfolioManager:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "kpi": {"total_capital": 240000.0, "total_wins": 0, "total_losses": 0, "win_rate": 0.0},
                 "orders": [],
+                "recent_trades": [],
                 "strategies": [{"name": s, "wins": 0, "losses": 0, "win_rate": 0.0, "allocated": 10000.0, "cash": 10000.0} for s in STRATEGY_ROSTER]
             }
 
@@ -432,7 +481,7 @@ class ExecutionEngine:
         discrepancy = signal_payload.get("discrepancy_pct", 1.5)
         beta = signal_payload.get("beta", 1.0)
         atr_14 = signal_payload.get("atr_14", 0.50)
-        direction = signal_payload.get("direction", "BUY")
+        direction = signal_payload.get("direction", "BUY").upper()
 
         tp, sl = calculate_dynamic_tp_sl(entry_price, discrepancy, beta, atr_14, direction)
 
@@ -440,8 +489,8 @@ class ExecutionEngine:
             "order_id": f"ORD_{int(time.time()*1000)}",
             "status": order_status,
             "strategy": strat_name,
-            "signal_ticker": signal_payload.get("signal_ticker"),
-            "signal_market": signal_payload.get("signal_market"),
+            "signal_ticker": signal_payload.get("signal_ticker", "-"),
+            "signal_market": signal_payload.get("signal_market", "-"),
             "action_ticker": signal_payload.get("action_ticker"),
             "action_market": action_market,
             "direction": direction,
@@ -460,7 +509,7 @@ class ExecutionEngine:
         self.portfolio_mgr.save()
 
         ttt_str = format_trigger_time(signal_time, action_time)
-        print(f"[{order_status}] Strategy: {strat_name} | Action: {position_record['action_ticker']} | TP: {tp} | SL: {sl} | Trigger Time: {ttt_str}")
+        print(f"[{order_status}] Strategy: {strat_name} | {direction} {position_record['action_ticker']} ({action_market}) | TP: {tp} | SL: {sl} | Trigger Time: {ttt_str}")
 
     def process_pending_queues(self):
         """Activates queued orders when the Action Market opens, updating entry price to real market open."""
@@ -478,7 +527,7 @@ class ExecutionEngine:
                             ticker = pos.get("action_ticker")
                             real_open_price = fetch_live_price(ticker)
                             
-                            # If we got a real open price, update entry price & TP/SL to remove gap bias
+                            # Update entry price & TP/SL to actual market open
                             if real_open_price and real_open_price > 0:
                                 pos["entry_price"] = real_open_price
                                 direction = pos.get("direction", "BUY")
@@ -490,13 +539,13 @@ class ExecutionEngine:
                             pos["action_time"] = datetime.now(timezone.utc).isoformat()
                             updated = True
                             ttt_str = format_trigger_time(pos.get("signal_time"), pos.get("action_time"))
-                            print(f"[MARKET OPENED] Order placed for {ticker} at ${pos['entry_price']}. Pull Trigger Time: {ttt_str}")
+                            print(f"[MARKET OPENED] Placed {pos.get('direction')} for {ticker} at ${pos['entry_price']}. Pull Trigger Time: {ttt_str}")
 
         if updated:
             self.portfolio_mgr.save()
 
     def check_active_positions_tp_sl(self):
-        """Monitors open positions and exits when TP or SL is reached (only when the exchange is open!)."""
+        """Monitors open positions and exits when TP or SL is reached (only when exchange is open!)."""
         positions_to_close = []
 
         with self.portfolio_mgr.lock:
@@ -509,7 +558,7 @@ class ExecutionEngine:
                     if pos.get("status") == "ACTIVE":
                         action_mkt = pos.get("action_market", "NYSE")
                         
-                        # ZERO network queries if that stock's exchange is closed!
+                        # Zero queries if that market is closed
                         if not is_market_open(action_mkt):
                             continue
 
@@ -521,7 +570,7 @@ class ExecutionEngine:
                         if not current_price:
                             continue
 
-                        direction = pos.get("direction", "BUY")
+                        direction = pos.get("direction", "BUY").upper()
                         tp = pos.get("tp_price", 999999)
                         sl = pos.get("sl_price", 0)
 
@@ -536,7 +585,6 @@ class ExecutionEngine:
                             elif current_price >= sl:
                                 positions_to_close.append((strat_name, ticker, current_price, "STOP_LOSS"))
 
-        # Close triggered positions
         for strat_name, ticker, exit_price, reason in positions_to_close:
             self.close_position(strat_name, ticker, exit_price, reason)
 
@@ -552,8 +600,9 @@ class ExecutionEngine:
                 if ticker == action_ticker and pos.get("status") == "ACTIVE":
                     qty = pos.get("qty", 100)
                     entry_price = pos.get("entry_price", exit_price)
-                    direction = pos.get("direction", "BUY")
+                    direction = pos.get("direction", "BUY").upper()
 
+                    # Multiplier: +1 for Long, -1 for Short
                     multiplier = 1 if direction in ["BUY", "LONG"] else -1
                     gross_pnl = round((exit_price - entry_price) * qty * multiplier, 2)
                     fee = round(max(1.00, qty * 0.005), 2)
@@ -581,7 +630,7 @@ class ExecutionEngine:
                         ])
 
                     strat_info["cash"] = round(strat_info.get("cash", 10000.0) + net_pnl, 2)
-                    print(f"🎯 [TRADE CLOSED] {strat_name} ({ticker}) at ${exit_price} | PnL: ${net_pnl} | Reason: {reason} | Trigger Time: {ttt_str}")
+                    print(f"🎯 [TRADE CLOSED] {strat_name} ({direction} {ticker}) at ${exit_price} | Net PnL: ${net_pnl} | Reason: {reason} | Trigger Time: {ttt_str}")
                 else:
                     remaining.append(pos)
 
@@ -589,7 +638,7 @@ class ExecutionEngine:
         self.portfolio_mgr.save()
 
 # =====================================================================
-# Main Loop (Resource-Efficient Polling)
+# Main Loop (Resource-Efficient 24/7 Engine)
 # =====================================================================
 
 if __name__ == "__main__":
@@ -614,7 +663,6 @@ if __name__ == "__main__":
     engine.process_signal(test_signal)
     engine.process_pending_queues()
 
-    # Smart background loop:
     # Checks pending queues and TP/SL every 60 seconds
     while True:
         try:
