@@ -6,8 +6,14 @@ import csv
 import zipfile
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import pandas as pd
+
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
 
 # =====================================================================
 # Configuration & Constants
@@ -32,15 +38,98 @@ STRATEGY_ROSTER = [
 ]
 
 EXCHANGE_HOURS_UTC = {
-    "NYSE": (13.5, 20.0),
+    "NYSE": (13.5, 20.0),    # 9:30 AM - 4:00 PM US ET
     "NASDAQ": (13.5, 20.0),
-    "TSX": (13.5, 20.0),
-    "XETR": (7.0, 15.5),
-    "TSE": (0.0, 6.0),
-    "KOSPI": (0.0, 6.5),
-    "CME": (0.0, 24.0),
-    "CRYPTO": (0.0, 24.0)
+    "TSX": (13.5, 20.0),     # Toronto
+    "XETR": (7.0, 15.5),     # Frankfurt
+    "LSE": (7.0, 15.5),      # London
+    "OMX": (7.0, 15.0),      # Nordic / Copenhagen
+    "TSE": (0.0, 6.5),       # Tokyo (9:00 AM - 3:30 PM JST)
+    "KOSPI": (0.0, 6.5),     # Seoul (9:00 AM - 3:30 PM KST)
+    "ASX": (23.0, 6.0),      # Sydney (opens 23:00 UTC previous day to 06:00 UTC)
+    "CME": (0.0, 24.0),      # Futures
+    "CRYPTO": (0.0, 24.0)    # 24/7
 }
+
+# =====================================================================
+# Market Calendar & Holiday Intelligence
+# =====================================================================
+
+def is_us_holiday(d: date) -> bool:
+    """Calculates major US market holidays where NYSE/NASDAQ are closed."""
+    # New Year's Day (Jan 1)
+    if d.month == 1 and d.day == 1:
+        return True
+    # MLK Day: 3rd Monday in January
+    if d.month == 1 and d.weekday() == 0 and 15 <= d.day <= 21:
+        return True
+    # Presidents' Day: 3rd Monday in February
+    if d.month == 2 and d.weekday() == 0 and 15 <= d.day <= 21:
+        return True
+    # Memorial Day: Last Monday in May
+    if d.month == 5 and d.weekday() == 0 and d.day >= 25:
+        return True
+    # Juneteenth: June 19
+    if d.month == 6 and d.day == 19:
+        return True
+    # Independence Day: July 4
+    if d.month == 7 and d.day == 4:
+        return True
+    # Labor Day: 1st Monday in September (e.g. today, Sept 7, 2026!)
+    if d.month == 9 and d.weekday() == 0 and 1 <= d.day <= 7:
+        return True
+    # Thanksgiving: 4th Thursday in November
+    if d.month == 11 and d.weekday() == 3 and 22 <= d.day <= 28:
+        return True
+    # Christmas Day: Dec 25
+    if d.month == 12 and d.day == 25:
+        return True
+    return False
+
+def is_market_open(market_name: str, now: datetime = None) -> bool:
+    """Smart market open check that handles timezones, Sunday Asian open, and holidays."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    market = market_name.upper()
+
+    if market == "CRYPTO":
+        return True
+
+    weekday = now.weekday()  # 0 = Monday, ..., 5 = Saturday, 6 = Sunday
+    utc_hour = now.hour + (now.minute / 60.0)
+
+    # Saturday: All equity & futures markets are closed worldwide
+    if weekday == 5:
+        return False
+
+    # Sunday:
+    if weekday == 6:
+        # CME futures open Sunday at 22:00 UTC (6:00 PM ET)
+        if market == "CME":
+            return utc_hour >= 22.0
+        # ASX (Australia) opens Sunday at 23:00 UTC (Monday 9:00 AM Sydney)
+        if market == "ASX":
+            return utc_hour >= 23.0
+        # All other stock markets are closed on Sunday
+        return False
+
+    # Friday closing: CME futures pause Friday at 21:00 UTC
+    if weekday == 4 and market == "CME" and utc_hour >= 21.0:
+        return False
+
+    # US market holiday check
+    if market in ["NYSE", "NASDAQ"] and is_us_holiday(now.date()):
+        return False
+
+    open_h, close_h = EXCHANGE_HOURS_UTC.get(market, (0.0, 24.0))
+    if open_h == 0.0 and close_h == 24.0:
+        return True
+
+    if open_h > close_h:
+        # Crosses midnight UTC (like ASX: 23:00 to 06:00 UTC)
+        return utc_hour >= open_h or utc_hour <= close_h
+
+    return open_h <= utc_hour <= close_h
 
 # =====================================================================
 # Utilities
@@ -58,16 +147,6 @@ def ensure_environment():
                 "trigger_time", "reason"
             ])
 
-def is_market_open(market_name: str) -> bool:
-    now = datetime.now(timezone.utc)
-    if now.weekday() >= 5 and market_name.upper() not in ["CME", "CRYPTO"]:
-        return False
-    open_h, close_h = EXCHANGE_HOURS_UTC.get(market_name.upper(), (0.0, 24.0))
-    if open_h == 0.0 and close_h == 24.0:
-        return True
-    utc_hour = now.hour + (now.minute / 60.0)
-    return open_h <= utc_hour <= close_h
-
 def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, beta: float = 1.0, atr_14: float = 0.50, direction: str = "BUY"):
     expected_move_pct = (signal_discrepancy_pct * beta) * 0.80
     if direction.upper() == "BUY":
@@ -79,16 +158,12 @@ def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, b
     return tp_price, sl_price
 
 def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
-    """Safe trigger time calculation that never crashes on None or invalid formats."""
+    """Calculates Pull the Trigger Time including all queuing time."""
     if not signal_time_iso or not isinstance(signal_time_iso, str):
         return "N/A"
     try:
         t_sig = datetime.fromisoformat(signal_time_iso)
-        if action_time_iso and isinstance(action_time_iso, str):
-            t_act = datetime.fromisoformat(action_time_iso)
-        else:
-            t_act = datetime.now(timezone.utc)
-        
+        t_act = datetime.fromisoformat(action_time_iso) if action_time_iso else datetime.now(timezone.utc)
         elapsed_sec = max(0, int((t_act - t_sig).total_seconds()))
         hours = elapsed_sec // 3600
         minutes = (elapsed_sec % 3600) // 60
@@ -100,6 +175,26 @@ def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
         return f"{seconds}s"
     except Exception:
         return "N/A"
+
+def fetch_live_price(ticker: str):
+    """Ultra-lightweight price fetcher using yfinance fast_info (minimal RAM/CPU)."""
+    if not YFINANCE_AVAILABLE:
+        return None
+    try:
+        t = yf.Ticker(ticker)
+        # fast_info only retrieves the latest quote without downloading historical tables
+        price = t.fast_info.get("last_price")
+        if price is not None and not pd.isna(price) and price > 0:
+            return round(float(price), 2)
+        # Fallback to single 1-minute candle
+        hist = t.history(period="1d", interval="1m")
+        if not hist.empty and "Close" in hist:
+            last_val = hist["Close"].iloc[-1]
+            if not pd.isna(last_val) and last_val > 0:
+                return round(float(last_val), 2)
+    except Exception:
+        pass
+    return None
 
 # =====================================================================
 # Portfolio Manager
@@ -157,7 +252,6 @@ class PortfolioManager:
         return stats
 
     def get_dashboard_payload(self):
-        """Safe payload generation for the live dashboard."""
         try:
             stats = self.get_strategy_stats()
             total_wins = sum(s["wins"] for s in stats.values())
@@ -177,7 +271,6 @@ class PortfolioManager:
                         pos_copy = dict(pos)
                         pos_copy["strategy"] = strat_name
                         pos_copy["status"] = pos.get("status", "ACTIVE")
-                        # Handle both new 'action_ticker' and legacy 'ticker'
                         pos_copy["action_ticker"] = pos.get("action_ticker") or pos.get("ticker", "UNKNOWN")
                         pos_copy["action_market"] = pos.get("action_market", "NYSE")
                         pos_copy["direction"] = pos.get("direction", "BUY")
@@ -187,7 +280,7 @@ class PortfolioManager:
                         pos_copy["sl_price"] = round(float(pos.get("sl_price", 0.0)), 2)
                         
                         sig_time = pos.get("signal_time") or pos.get("entry_time")
-                        act_time = pos.get("action_time") or pos.get("entry_time")
+                        act_time = pos.get("action_time")
                         pos_copy["pull_trigger_time"] = format_trigger_time(sig_time, act_time)
                         all_orders.append(pos_copy)
 
@@ -219,7 +312,6 @@ class PortfolioManager:
                 "strategies": strat_list
             }
         except Exception as e:
-            print(f"[ERROR] get_dashboard_payload error: {e}")
             return {
                 "status": "online",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -295,7 +387,6 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
 
         except Exception as e:
-            print(f"[ERROR] HTTP handler: {e}")
             try:
                 err_body = json.dumps({"error": str(e)}).encode("utf-8")
                 self.send_response(500)
@@ -372,6 +463,7 @@ class ExecutionEngine:
         print(f"[{order_status}] Strategy: {strat_name} | Action: {position_record['action_ticker']} | TP: {tp} | SL: {sl} | Trigger Time: {ttt_str}")
 
     def process_pending_queues(self):
+        """Activates queued orders when the Action Market opens, updating entry price to real market open."""
         updated = False
         with self.portfolio_mgr.lock:
             for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
@@ -381,23 +473,128 @@ class ExecutionEngine:
                     if not isinstance(pos, dict):
                         continue
                     if pos.get("status") == "PENDING_MARKET_OPEN":
-                        if is_market_open(pos.get("action_market", "NYSE")):
+                        action_mkt = pos.get("action_market", "NYSE")
+                        if is_market_open(action_mkt):
+                            ticker = pos.get("action_ticker")
+                            real_open_price = fetch_live_price(ticker)
+                            
+                            # If we got a real open price, update entry price & TP/SL to remove gap bias
+                            if real_open_price and real_open_price > 0:
+                                pos["entry_price"] = real_open_price
+                                direction = pos.get("direction", "BUY")
+                                tp, sl = calculate_dynamic_tp_sl(real_open_price, 1.5, 1.0, 0.50, direction)
+                                pos["tp_price"] = tp
+                                pos["sl_price"] = sl
+
                             pos["status"] = "ACTIVE"
                             pos["action_time"] = datetime.now(timezone.utc).isoformat()
                             updated = True
                             ttt_str = format_trigger_time(pos.get("signal_time"), pos.get("action_time"))
-                            print(f"[MARKET OPENED] Activated order for {pos.get('action_ticker')}. Pull Trigger Time: {ttt_str}")
+                            print(f"[MARKET OPENED] Order placed for {ticker} at ${pos['entry_price']}. Pull Trigger Time: {ttt_str}")
 
         if updated:
             self.portfolio_mgr.save()
 
+    def check_active_positions_tp_sl(self):
+        """Monitors open positions and exits when TP or SL is reached (only when the exchange is open!)."""
+        positions_to_close = []
+
+        with self.portfolio_mgr.lock:
+            for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
+                if not isinstance(strat_info, dict):
+                    continue
+                for pos in strat_info.get("positions", []):
+                    if not isinstance(pos, dict):
+                        continue
+                    if pos.get("status") == "ACTIVE":
+                        action_mkt = pos.get("action_market", "NYSE")
+                        
+                        # ZERO network queries if that stock's exchange is closed!
+                        if not is_market_open(action_mkt):
+                            continue
+
+                        ticker = pos.get("action_ticker") or pos.get("ticker")
+                        if not ticker:
+                            continue
+
+                        current_price = fetch_live_price(ticker)
+                        if not current_price:
+                            continue
+
+                        direction = pos.get("direction", "BUY")
+                        tp = pos.get("tp_price", 999999)
+                        sl = pos.get("sl_price", 0)
+
+                        if direction in ["BUY", "LONG"]:
+                            if current_price >= tp:
+                                positions_to_close.append((strat_name, ticker, current_price, "TAKE_PROFIT"))
+                            elif current_price <= sl:
+                                positions_to_close.append((strat_name, ticker, current_price, "STOP_LOSS"))
+                        else:  # SELL / SHORT
+                            if current_price <= tp:
+                                positions_to_close.append((strat_name, ticker, current_price, "TAKE_PROFIT"))
+                            elif current_price >= sl:
+                                positions_to_close.append((strat_name, ticker, current_price, "STOP_LOSS"))
+
+        # Close triggered positions
+        for strat_name, ticker, exit_price, reason in positions_to_close:
+            self.close_position(strat_name, ticker, exit_price, reason)
+
+    def close_position(self, strat_name: str, action_ticker: str, exit_price: float, reason: str = "TAKE_PROFIT"):
+        strat_info = self.portfolio_mgr.data["strategies"].get(strat_name)
+        if not strat_info:
+            return
+
+        remaining = []
+        with self.portfolio_mgr.lock:
+            for pos in strat_info.get("positions", []):
+                ticker = pos.get("action_ticker") or pos.get("ticker")
+                if ticker == action_ticker and pos.get("status") == "ACTIVE":
+                    qty = pos.get("qty", 100)
+                    entry_price = pos.get("entry_price", exit_price)
+                    direction = pos.get("direction", "BUY")
+
+                    multiplier = 1 if direction in ["BUY", "LONG"] else -1
+                    gross_pnl = round((exit_price - entry_price) * qty * multiplier, 2)
+                    fee = round(max(1.00, qty * 0.005), 2)
+                    net_pnl = round(gross_pnl - fee, 2)
+                    
+                    sig_time = pos.get("signal_time") or pos.get("entry_time")
+                    act_time = pos.get("action_time")
+                    ttt_str = format_trigger_time(sig_time, act_time)
+
+                    with open(HISTORY_PATH, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            datetime.now(timezone.utc).isoformat(),
+                            strat_name,
+                            pos.get("signal_ticker", "-"),
+                            ticker,
+                            f"CLOSE_{direction}",
+                            qty,
+                            exit_price,
+                            gross_pnl,
+                            fee,
+                            net_pnl,
+                            ttt_str,
+                            reason
+                        ])
+
+                    strat_info["cash"] = round(strat_info.get("cash", 10000.0) + net_pnl, 2)
+                    print(f"🎯 [TRADE CLOSED] {strat_name} ({ticker}) at ${exit_price} | PnL: ${net_pnl} | Reason: {reason} | Trigger Time: {ttt_str}")
+                else:
+                    remaining.append(pos)
+
+            strat_info["positions"] = remaining
+        self.portfolio_mgr.save()
+
 # =====================================================================
-# Main Loop
+# Main Loop (Resource-Efficient Polling)
 # =====================================================================
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    print("🚀 LagTrader Engine Running with Live API...")
+    print("🚀 LagTrader Engine Running. Smart 24/7 Market Monitor Active.")
 
     test_signal = {
         "strategy": "SKHY_ADR_FX_Neutralization",
@@ -417,6 +614,12 @@ if __name__ == "__main__":
     engine.process_signal(test_signal)
     engine.process_pending_queues()
 
+    # Smart background loop:
+    # Checks pending queues and TP/SL every 60 seconds
     while True:
+        try:
+            engine.process_pending_queues()
+            engine.check_active_positions_tp_sl()
+        except Exception as e:
+            print(f"[LOOP ERROR] {e}")
         time.sleep(60)
-        engine.process_pending_queues()
