@@ -28,6 +28,8 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "e5412639c4844ff8b877b
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "wallstreetdibs/lagtrader")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
+GITHUB_LOCK = threading.Lock()
+
 STRATEGY_ROSTER = [
     "ASX_ADR_Arbitrage", "US_Earnings_Lag", "Inventory_Drift_Reversal",
     "Crypto_FinTech_Echo", "Sentiment_Echo", "Nikkei_ADR_Front_Run", 
@@ -95,31 +97,32 @@ def pull_file_from_github(file_path: str, repo: str, token: str):
 
 def sync_file_to_github(file_path: str, repo: str, token: str, commit_msg: str):
     if not repo or not token or not os.path.exists(file_path): return False
-    try:
-        filename = os.path.basename(file_path)
-        repo_path = f"data/{filename}"
-        api_url = f"https://api.github.com/repos/{repo}/contents/{repo_path}"
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json", "User-Agent": "LagTrader"}
-
-        sha = None
+    with GITHUB_LOCK:
         try:
-            req = urllib.request.Request(api_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                sha = data.get("sha")
-        except urllib.error.HTTPError as e:
-            if e.code != 404: pass
+            filename = os.path.basename(file_path)
+            repo_path = f"data/{filename}"
+            api_url = f"https://api.github.com/repos/{repo}/contents/{repo_path}"
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json", "User-Agent": "LagTrader"}
 
-        with open(file_path, "rb") as f: content_bytes = f.read()
-        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
+            sha = None
+            try:
+                req = urllib.request.Request(api_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    sha = data.get("sha")
+            except urllib.error.HTTPError as e:
+                if e.code != 404: pass
 
-        payload = {"message": commit_msg, "content": content_b64}
-        if sha: payload["sha"] = sha
+            with open(file_path, "rb") as f: content_bytes = f.read()
+            content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
-        put_req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT")
-        with urllib.request.urlopen(put_req, timeout=10):
-            return True
-    except Exception: return False
+            payload = {"message": commit_msg, "content": content_b64}
+            if sha: payload["sha"] = sha
+
+            put_req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT")
+            with urllib.request.urlopen(put_req, timeout=10):
+                return True
+        except Exception: return False
 
 def is_us_holiday(d: date) -> bool:
     if d.month == 1 and d.day == 1: return True
@@ -374,6 +377,7 @@ class PortfolioManager:
                             cutoff = datetime.now(timezone.utc) - timedelta(days=90)
                             df = df[df['timestamp'] >= cutoff]
                             df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S%z')
+                        df = df.fillna("-")
                         recent_trades = df.to_dict(orient="records")
                         recent_trades.reverse()
                 except Exception: pass
@@ -523,6 +527,14 @@ class ExecutionEngine:
 
         strat_dict["positions"].append(position_record)
         self.portfolio_mgr.save()
+
+        if GITHUB_REPO and GITHUB_TOKEN:
+            threading.Thread(
+                target=sync_file_to_github,
+                args=(PORTFOLIO_PATH, GITHUB_REPO, GITHUB_TOKEN, f"Auto-sync: new order {action_ticker}"),
+                daemon=True
+            ).start()
+
         return True, f"Order placed ({order_status})"
 
     def process_pending_queues(self):
@@ -547,9 +559,29 @@ class ExecutionEngine:
                                 elif direction in ["SELL", "SHORT"] and current_945_price > old_entry * 1.015: is_trap = True
 
                                 if is_trap:
-                                    refund = pos.get("invested_capital", old_entry * pos["qty"])
+                                    refund = pos.get("invested_capital", old_entry * pos.get("qty", 100))
                                     strat_info["cash"] = round(strat_info.get("cash", 0.0) + refund, 2)
                                     updated = True
+
+                                    sig_time = pos.get("signal_time") or pos.get("entry_time", "-")
+                                    act_time = datetime.now(timezone.utc).isoformat()
+                                    ttt_str = format_trigger_time(sig_time, act_time)
+
+                                    with open(HISTORY_PATH, "a", newline="") as f:
+                                        writer = csv.writer(f)
+                                        writer.writerow([
+                                            act_time,
+                                            strat_name, pos.get("signal_ticker", "-"), ticker,
+                                            f"CANCEL_{direction}", pos.get("qty", 100), current_945_price, 0.0, 0.0, 0.0,
+                                            ttt_str, "TRAP_CANCELLED", sig_time, act_time
+                                        ])
+
+                                    if GITHUB_REPO and GITHUB_TOKEN:
+                                        threading.Thread(
+                                            target=sync_file_to_github,
+                                            args=(HISTORY_PATH, GITHUB_REPO, GITHUB_TOKEN, f"Auto-sync: trap canceled {ticker}"),
+                                            daemon=True
+                                        ).start()
                                     continue 
 
                                 old_cost = pos.get("invested_capital", old_entry * pos["qty"])
@@ -568,7 +600,14 @@ class ExecutionEngine:
                             updated = True
                     remaining_positions.append(pos)
                 strat_info["positions"] = remaining_positions
-        if updated: self.portfolio_mgr.save()
+        if updated:
+            self.portfolio_mgr.save()
+            if GITHUB_REPO and GITHUB_TOKEN:
+                threading.Thread(
+                    target=sync_file_to_github,
+                    args=(PORTFOLIO_PATH, GITHUB_REPO, GITHUB_TOKEN, "Auto-sync: queues updated"),
+                    daemon=True
+                ).start()
 
     def check_active_positions_tp_sl(self):
         positions_to_close = []
