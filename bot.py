@@ -39,7 +39,7 @@ STRATEGY_ROSTER = [
     "Crypto_Weekend_Gap_Run", "SoftBank_ARM_Nexus",
     "SKHY_Global_Nexus", "MSTR_NAV_Premium_Reversion", 
     "Nuclear_Datacenter_Echo", "Silver_to_Gold_Ratio_Catchup", 
-    "Sympathy_Earnings_Fade", "Grid_Hardware_Capex_Echo", "Index_Inclusion_Drift"
+    "Sympathy_Earnings_Fade", "Defense_Tech_Relay", "AI_Power_Grid_Echo"
 ]
 
 EXCHANGE_HOURS_UTC = {
@@ -90,7 +90,7 @@ def pull_file_from_github(file_path: str, repo: str, token: str):
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
                 with open(file_path, "wb") as f: f.write(file_bytes)
                 return True
-    except: pass
+    except Exception: pass
     return False
 
 def sync_file_to_github(file_path: str, repo: str, token: str, commit_msg: str):
@@ -119,7 +119,7 @@ def sync_file_to_github(file_path: str, repo: str, token: str, commit_msg: str):
         put_req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT")
         with urllib.request.urlopen(put_req, timeout=10):
             return True
-    except: return False
+    except Exception: return False
 
 def is_us_holiday(d: date) -> bool:
     if d.month == 1 and d.day == 1: return True
@@ -166,7 +166,7 @@ def fetch_twelvedata_price(ticker: str, api_key: str):
             if "price" in data:
                 val = float(data["price"])
                 if val > 0: return round(val, 2)
-    except: pass
+    except Exception: pass
     return None
 
 def fetch_live_price(ticker: str):
@@ -174,13 +174,17 @@ def fetch_live_price(ticker: str):
     if YFINANCE_AVAILABLE:
         try:
             t = yf.Ticker(ticker)
-            price = t.fast_info.get("last_price")
-            if price is not None and not pd.isna(price) and price > 0: return round(float(price), 2)
+            price = None
+            if hasattr(t, "fast_info"):
+                price = getattr(t.fast_info, "last_price", None) or t.fast_info.get("last_price", None)
+            if price is not None and not pd.isna(price) and price > 0:
+                return round(float(price), 2)
             hist = t.history(period="1d", interval="1m")
             if not hist.empty and "Close" in hist:
                 last_val = hist["Close"].iloc[-1]
-                if not pd.isna(last_val) and last_val > 0: return round(float(last_val), 2)
-        except: pass
+                if not pd.isna(last_val) and last_val > 0:
+                    return round(float(last_val), 2)
+        except Exception: pass
 
     if TWELVEDATA_API_KEY:
         td_price = fetch_twelvedata_price(ticker, TWELVEDATA_API_KEY)
@@ -221,7 +225,7 @@ def ensure_environment():
                         args=(HISTORY_PATH, GITHUB_REPO, GITHUB_TOKEN, "Auto-sync: migrate CSV columns"),
                         daemon=True
                     ).start()
-        except: pass
+        except Exception: pass
 
 def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, beta: float = 1.0, atr_14: float = 0.50, direction: str = "BUY"):
     direction_clean = direction.upper()
@@ -241,10 +245,10 @@ def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, b
     return tp_price, sl_price
 
 def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
-    if not signal_time_iso or not isinstance(signal_time_iso, str): return "N/A"
+    if not signal_time_iso or not isinstance(signal_time_iso, str) or signal_time_iso == "-": return "N/A"
     try:
         t_sig = datetime.fromisoformat(signal_time_iso)
-        t_act = datetime.fromisoformat(action_time_iso) if action_time_iso else datetime.now(timezone.utc)
+        t_act = datetime.fromisoformat(action_time_iso) if (action_time_iso and action_time_iso != "-") else datetime.now(timezone.utc)
         elapsed_sec = max(0, int((t_act - t_sig).total_seconds()))
         hours = elapsed_sec // 3600
         minutes = (elapsed_sec % 3600) // 60
@@ -252,7 +256,7 @@ def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
         if hours > 0: return f"{hours}h {minutes}m"
         elif minutes > 0: return f"{minutes}m {seconds}s"
         return f"{seconds}s"
-    except: return "N/A"
+    except Exception: return "N/A"
 
 class PortfolioManager:
     def __init__(self, filepath=PORTFOLIO_PATH):
@@ -267,7 +271,7 @@ class PortfolioManager:
                     data = json.load(f)
                     self._reconcile_roster(data)
                     return data
-            except: pass
+            except Exception: pass
         return self._build_default_state()
 
     def _build_default_state(self):
@@ -286,8 +290,10 @@ class PortfolioManager:
 
     def save(self):
         with self.lock:
-            with open(self.filepath, "w") as f:
+            temp_file = f"{self.filepath}.tmp"
+            with open(temp_file, "w") as f:
                 json.dump(self.data, f, indent=2)
+            os.replace(temp_file, self.filepath)
 
     def get_strategy_stats(self):
         stats = {strat: {"wins": 0, "losses": 0, "win_rate": 0.0, "realized_pnl": 0.0} for strat in STRATEGY_ROSTER}
@@ -302,7 +308,7 @@ class PortfolioManager:
                         win_rate = round((wins / total) * 100, 1) if total > 0 else 0.0
                         realized_pnl = float(group["net_pnl"].sum())
                         stats[strat] = {"wins": wins, "losses": losses, "win_rate": win_rate, "realized_pnl": realized_pnl}
-            except: pass
+            except Exception: pass
         return stats
 
     def get_dashboard_payload(self):
@@ -347,12 +353,13 @@ class PortfolioManager:
                 s_dict = self.data.get("strategies", {}).get(s, {})
                 allocated = s_dict.get("allocated", 10000.0) if isinstance(s_dict, dict) else 10000.0
                 cash = s_dict.get("cash", 10000.0) if isinstance(s_dict, dict) else 10000.0
-                s_stat = stats.get(s, {"wins": 0, "losses": 0, "win_rate": 0.0})
+                s_stat = stats.get(s, {"wins": 0, "losses": 0, "win_rate": 0.0, "realized_pnl": 0.0})
                 strat_list.append({
                     "name": s,
                     "wins": s_stat["wins"],
                     "losses": s_stat["losses"],
                     "win_rate": s_stat["win_rate"],
+                    "realized_pnl": round(s_stat["realized_pnl"], 2),
                     "allocated": round(float(allocated), 2),
                     "cash": round(float(cash), 2)
                 })
@@ -369,7 +376,7 @@ class PortfolioManager:
                             df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S%z')
                         recent_trades = df.to_dict(orient="records")
                         recent_trades.reverse()
-                except: pass
+                except Exception: pass
 
             return {
                 "status": "online",
@@ -377,6 +384,7 @@ class PortfolioManager:
                 "kpi": {
                     "initial_capital": round(initial_capital, 2),
                     "current_capital": round(current_capital, 2),
+                    "total_realized_pnl": round(total_realized_pnl, 2),
                     "total_wins": total_wins,
                     "total_losses": total_losses,
                     "win_rate": overall_win_rate
@@ -385,7 +393,7 @@ class PortfolioManager:
                 "recent_trades": recent_trades,
                 "strategies": strat_list
             }
-        except:
+        except Exception:
             return {"status": "error", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 ENGINE_INSTANCE = None
@@ -502,8 +510,9 @@ class ExecutionEngine:
         strat_dict["cash"] = round(available_cash - required_capital, 2)
         tp, sl = calculate_dynamic_tp_sl(entry_price, discrepancy, beta, atr_14, direction)
 
+        order_id = f"ORD_{int(time.time()*1000)}"
         position_record = {
-            "order_id": f"ORD_{int(time.time()*1000)}",
+            "order_id": order_id,
             "status": order_status, "strategy": strat_name,
             "signal_ticker": signal_payload.get("signal_ticker", "-"), "signal_market": signal_payload.get("signal_market", "-"),
             "action_ticker": action_ticker, "action_market": action_market,
@@ -579,18 +588,19 @@ class ExecutionEngine:
                         direction = pos.get("direction", "BUY").upper()
                         tp = pos.get("tp_price", 999999)
                         sl = pos.get("sl_price", 0)
+                        order_id = pos.get("order_id")
 
                         if direction in ["BUY", "LONG"]:
-                            if current_price >= tp: positions_to_close.append((strat_name, ticker, current_price, "TAKE_PROFIT"))
-                            elif current_price <= sl: positions_to_close.append((strat_name, ticker, current_price, "STOP_LOSS"))
+                            if current_price >= tp: positions_to_close.append((strat_name, order_id, ticker, current_price, "TAKE_PROFIT"))
+                            elif current_price <= sl: positions_to_close.append((strat_name, order_id, ticker, current_price, "STOP_LOSS"))
                         else:
-                            if current_price <= tp: positions_to_close.append((strat_name, ticker, current_price, "TAKE_PROFIT"))
-                            elif current_price >= sl: positions_to_close.append((strat_name, ticker, current_price, "STOP_LOSS"))
+                            if current_price <= tp: positions_to_close.append((strat_name, order_id, ticker, current_price, "TAKE_PROFIT"))
+                            elif current_price >= sl: positions_to_close.append((strat_name, order_id, ticker, current_price, "STOP_LOSS"))
 
-        for strat_name, ticker, exit_price, reason in positions_to_close:
-            self.close_position(strat_name, ticker, exit_price, reason)
+        for strat_name, order_id, ticker, exit_price, reason in positions_to_close:
+            self.close_position(strat_name, order_id, ticker, exit_price, reason)
 
-    def close_position(self, strat_name: str, action_ticker: str, exit_price: float, reason: str = "TAKE_PROFIT"):
+    def close_position(self, strat_name: str, order_id: str, action_ticker: str, exit_price: float, reason: str = "TAKE_PROFIT"):
         strat_info = self.portfolio_mgr.data["strategies"].get(strat_name)
         if not strat_info: return
 
@@ -598,7 +608,11 @@ class ExecutionEngine:
         with self.portfolio_mgr.lock:
             for pos in strat_info.get("positions", []):
                 ticker = pos.get("action_ticker") or pos.get("ticker")
-                if ticker == action_ticker and pos.get("status") == "ACTIVE":
+                pos_ord_id = pos.get("order_id")
+                
+                match = (pos_ord_id == order_id) if order_id else (ticker == action_ticker and pos.get("status") == "ACTIVE")
+                
+                if match and pos.get("status") == "ACTIVE":
                     qty = pos.get("qty", 100)
                     entry_price = pos.get("entry_price", exit_price)
                     direction = pos.get("direction", "BUY").upper()
@@ -635,10 +649,10 @@ class ExecutionEngine:
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    print(f"🚀 LagTrader Engine Running ({len(STRATEGY_ROSTER)} Models).")
+    print("🚀 LagTrader Engine Running (29 Models).")
     while True:
         try:
             engine.process_pending_queues()
             engine.check_active_positions_tp_sl()
-        except: pass
+        except Exception: pass
         time.sleep(60)
