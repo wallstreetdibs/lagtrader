@@ -30,15 +30,16 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 STRATEGY_ROSTER = [
     "ASX_ADR_Arbitrage", "US_Earnings_Lag", "Inventory_Drift_Reversal",
-    "Futures_Lead_Front_Run", "Crypto_FinTech_Echo", "Sentiment_Echo",
-    "Immediate_Index_Proxy", "Nikkei_ADR_Front_Run", "WTI_Crude_Lag",
-    "Gold_Futures_Echo", "Biotech_News_Lag", "Cross_Listed_Pair_Fade",
-    "Time_Zone_Momentum_Relay", "FX_Adjusted_Earnings_Arb", "Commodity_Proxy_Lag",
-    "ETF_NAV_Window_Arb", "Nikkei_Tech_Relay", "London_Metals_Catchup",
-    "Treasury_Shockwave", "Canadian_Energy_Echo", "ETF_Creation_Lag",
-    "SKHY_ADR_FX_Neutralization", "SKHY_HBM_Supply_Chain", "SKHY_Post_Market_KOSPI",
+    "Crypto_FinTech_Echo", "Sentiment_Echo", "Nikkei_ADR_Front_Run", 
+    "WTI_Crude_Lag", "Gold_Futures_Echo", "Biotech_News_Lag", 
+    "Cross_Listed_Pair_Fade", "Time_Zone_Momentum_Relay", 
+    "FX_Adjusted_Earnings_Arb", "Commodity_Proxy_Lag", "Nikkei_Tech_Relay", 
+    "London_Metals_Catchup", "Treasury_Shockwave", "Canadian_Energy_Echo",
     "TSMC_ADR_Arbitrage", "EUV_Lithography_Echo", "GLP1_Duopoly_Relay",
-    "Crypto_Weekend_Gap_Run", "SoftBank_ARM_Nexus"
+    "Crypto_Weekend_Gap_Run", "SoftBank_ARM_Nexus",
+    "SKHY_Global_Nexus", "MSTR_NAV_Premium_Reversion", 
+    "Nuclear_Datacenter_Echo", "Silver_to_Gold_Ratio_Catchup", 
+    "Sympathy_Earnings_Fade", "Grid_Hardware_Capex_Echo", "Index_Inclusion_Drift"
 ]
 
 EXCHANGE_HOURS_UTC = {
@@ -634,7 +635,7 @@ class ExecutionEngine:
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    print("🚀 LagTrader Engine Running (29 Models).")
+    print(f"🚀 LagTrader Engine Running ({len(STRATEGY_ROSTER)} Models).")
     while True:
         try:
             engine.process_pending_queues()
