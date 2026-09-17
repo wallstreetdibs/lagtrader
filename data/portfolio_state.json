@@ -1,202 +1,208 @@
 {
-  "total_capital": 290000.0,
-  "strategies": {
-    "ASX_ADR_Arbitrage": {
-      "allocated": 10000.0,
-      "cash": 9586.28,
-      "positions": []
-    },
-    "US_Earnings_Lag": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "Inventory_Drift_Reversal": {
-      "allocated": 10000.0,
-      "cash": 9077.37,
-      "positions": []
-    },
-    "Futures_Lead_Front_Run": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "Crypto_FinTech_Echo": {
-      "allocated": 10000.0,
-      "cash": 508.0566702156066,
-      "positions": [
-        {
-          "ticker": "ADE.DE",
-          "direction": "LONG",
-          "entry_price": 26.799999237060547,
-          "qty": 354,
-          "tp_price": 28.40799919128418,
-          "sl_price": 26.263999252319337,
-          "entry_fee": 4.743599864959717,
-          "entry_time": "2026-09-07T20:07:33.969842+00:00",
-          "status": "ACTIVE",
-          "action_time": "2026-09-07T20:07:33.969842+00:00"
-        }
-      ]
-    },
-    "Sentiment_Echo": {
-      "allocated": 10000.0,
-      "cash": 9386.77,
-      "positions": []
-    },
-    "Immediate_Index_Proxy": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "Nikkei_ADR_Front_Run": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "WTI_Crude_Lag": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "Gold_Futures_Echo": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "Biotech_News_Lag": {
-      "allocated": 10000.0,
-      "cash": 9564.12,
-      "positions": []
-    },
-    "Cross_Listed_Pair_Fade": {
-      "allocated": 10000.0,
-      "cash": 10222.71,
-      "positions": []
-    },
-    "Time_Zone_Momentum_Relay": {
-      "allocated": 10000.0,
-      "cash": 9926.07,
-      "positions": []
-    },
-    "FX_Adjusted_Earnings_Arb": {
-      "allocated": 10000.0,
-      "cash": 571.3300537109371,
-      "positions": [
-        {
-          "ticker": "WMT",
-          "direction": "LONG",
-          "entry_price": 107.13999938964844,
-          "qty": 88,
-          "tp_price": 109.81849937438965,
-          "sl_price": 106.06859939575195,
-          "entry_fee": 0.35,
-          "entry_time": "2026-09-07T20:07:36.725734+00:00",
-          "status": "ACTIVE",
-          "action_time": "2026-09-07T20:07:36.725734+00:00"
-        }
-      ]
-    },
-    "Commodity_Proxy_Lag": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "ETF_NAV_Window_Arb": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "Nikkei_Tech_Relay": {
-      "allocated": 10000.0,
-      "cash": 651.8700317382809,
-      "positions": [
-        {
-          "ticker": "QQQ",
-          "direction": "LONG",
-          "entry_price": 719.0599975585938,
-          "qty": 13,
-          "tp_price": 727.6887175292969,
-          "sl_price": 714.7456375732422,
-          "entry_fee": 0.35,
-          "entry_time": "2026-09-07T20:07:37.336399+00:00",
-          "status": "ACTIVE",
-          "action_time": "2026-09-07T20:07:37.336399+00:00"
-        }
-      ]
-    },
-    "London_Metals_Catchup": {
-      "allocated": 10000.0,
-      "cash": 9761.29,
-      "positions": []
-    },
-    "Treasury_Shockwave": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "Canadian_Energy_Echo": {
-      "allocated": 10000.0,
-      "cash": 10414.46,
-      "positions": []
-    },
-    "ETF_Creation_Lag": {
-      "allocated": 10000.0,
-      "cash": 506.895536960601,
-      "positions": [
-        {
-          "ticker": "VVSM.DE",
-          "direction": "LONG",
-          "entry_price": 92.12000274658203,
-          "qty": 103,
-          "tp_price": 92.8109027671814,
-          "sl_price": 91.65940273284912,
-          "entry_fee": 4.744180141448974,
-          "entry_time": "2026-09-07T20:07:38.484427+00:00",
-          "status": "ACTIVE",
-          "action_time": "2026-09-07T20:07:38.484427+00:00"
-        }
-      ]
-    },
-    "SKHY_ADR_FX_Neutralization": {
-      "allocated": 10000.0,
-      "cash": 10374.68,
-      "positions": []
-    },
-    "SKHY_HBM_Supply_Chain": {
-      "allocated": 10000.0,
-      "cash": 10374.68,
-      "positions": []
-    },
-    "SKHY_Post_Market_KOSPI": {
-      "allocated": 10000.0,
-      "cash": 10374.68,
-      "positions": []
-    },
-    "TSMC_ADR_Arbitrage": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "EUV_Lithography_Echo": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "GLP1_Duopoly_Relay": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "Crypto_Weekend_Gap_Run": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    },
-    "SoftBank_ARM_Nexus": {
-      "allocated": 10000.0,
-      "cash": 10000.0,
-      "positions": []
-    }
-  }
+    "strategies":  {
+                       "TSMC_ADR_Arbitrage":  {
+                                                  "allocated":  10000,
+                                                  "cash":  10000,
+                                                  "positions":  [
+
+                                                                ]
+                                              },
+                       "Treasury_Shockwave":  {
+                                                  "allocated":  10000,
+                                                  "cash":  10000,
+                                                  "positions":  [
+
+                                                                ]
+                                              },
+                       "GLP1_Duopoly_Relay":  {
+                                                  "allocated":  10000,
+                                                  "cash":  10000,
+                                                  "positions":  [
+
+                                                                ]
+                                              },
+                       "ETF_NAV_Window_Arb":  {
+                                                  "allocated":  10000,
+                                                  "cash":  10000,
+                                                  "positions":  [
+
+                                                                ]
+                                              },
+                       "SKHY_Post_Market_KOSPI":  {
+                                                      "allocated":  10000,
+                                                      "cash":  10000,
+                                                      "positions":  [
+
+                                                                    ]
+                                                  },
+                       "WTI_Crude_Lag":  {
+                                             "allocated":  10000,
+                                             "cash":  10000,
+                                             "positions":  [
+
+                                                           ]
+                                         },
+                       "Futures_Lead_Front_Run":  {
+                                                      "allocated":  10000,
+                                                      "cash":  10000,
+                                                      "positions":  [
+
+                                                                    ]
+                                                  },
+                       "Biotech_News_Lag":  {
+                                                "allocated":  10000,
+                                                "cash":  10000,
+                                                "positions":  [
+
+                                                              ]
+                                            },
+                       "Immediate_Index_Proxy":  {
+                                                     "allocated":  10000,
+                                                     "cash":  10000,
+                                                     "positions":  [
+
+                                                                   ]
+                                                 },
+                       "Crypto_FinTech_Echo":  {
+                                                   "allocated":  10000,
+                                                   "cash":  10000,
+                                                   "positions":  [
+
+                                                                 ]
+                                               },
+                       "Sentiment_Echo":  {
+                                              "allocated":  10000,
+                                              "cash":  10000,
+                                              "positions":  [
+
+                                                            ]
+                                          },
+                       "US_Earnings_Lag":  {
+                                               "allocated":  10000,
+                                               "cash":  10000,
+                                               "positions":  [
+
+                                                             ]
+                                           },
+                       "Crypto_Weekend_Gap_Run":  {
+                                                      "allocated":  10000,
+                                                      "cash":  10000,
+                                                      "positions":  [
+
+                                                                    ]
+                                                  },
+                       "EUV_Lithography_Echo":  {
+                                                    "allocated":  10000,
+                                                    "cash":  10000,
+                                                    "positions":  [
+
+                                                                  ]
+                                                },
+                       "ETF_Creation_Lag":  {
+                                                "allocated":  10000,
+                                                "cash":  10000,
+                                                "positions":  [
+
+                                                              ]
+                                            },
+                       "Cross_Listed_Pair_Fade":  {
+                                                      "allocated":  10000,
+                                                      "cash":  10000,
+                                                      "positions":  [
+
+                                                                    ]
+                                                  },
+                       "Canadian_Energy_Echo":  {
+                                                    "allocated":  10000,
+                                                    "cash":  10000,
+                                                    "positions":  [
+
+                                                                  ]
+                                                },
+                       "Inventory_Drift_Reversal":  {
+                                                        "allocated":  10000,
+                                                        "cash":  10000,
+                                                        "positions":  [
+
+                                                                      ]
+                                                    },
+                       "FX_Adjusted_Earnings_Arb":  {
+                                                        "allocated":  10000,
+                                                        "cash":  10000,
+                                                        "positions":  [
+
+                                                                      ]
+                                                    },
+                       "ASX_ADR_Arbitrage":  {
+                                                 "allocated":  10000,
+                                                 "cash":  10000,
+                                                 "positions":  [
+
+                                                               ]
+                                             },
+                       "Commodity_Proxy_Lag":  {
+                                                   "allocated":  10000,
+                                                   "cash":  10000,
+                                                   "positions":  [
+
+                                                                 ]
+                                               },
+                       "London_Metals_Catchup":  {
+                                                     "allocated":  10000,
+                                                     "cash":  10000,
+                                                     "positions":  [
+
+                                                                   ]
+                                                 },
+                       "Nikkei_Tech_Relay":  {
+                                                 "allocated":  10000,
+                                                 "cash":  10000,
+                                                 "positions":  [
+
+                                                               ]
+                                             },
+                       "Gold_Futures_Echo":  {
+                                                 "allocated":  10000,
+                                                 "cash":  10000,
+                                                 "positions":  [
+
+                                                               ]
+                                             },
+                       "Time_Zone_Momentum_Relay":  {
+                                                        "allocated":  10000,
+                                                        "cash":  10000,
+                                                        "positions":  [
+
+                                                                      ]
+                                                    },
+                       "SKHY_HBM_Supply_Chain":  {
+                                                     "allocated":  10000,
+                                                     "cash":  10000,
+                                                     "positions":  [
+
+                                                                   ]
+                                                 },
+                       "SKHY_ADR_FX_Neutralization":  {
+                                                          "allocated":  10000,
+                                                          "cash":  10000,
+                                                          "positions":  [
+
+                                                                        ]
+                                                      },
+                       "SoftBank_ARM_Nexus":  {
+                                                  "allocated":  10000,
+                                                  "cash":  10000,
+                                                  "positions":  [
+
+                                                                ]
+                                              },
+                       "Nikkei_ADR_Front_Run":  {
+                                                    "allocated":  10000,
+                                                    "cash":  10000,
+                                                    "positions":  [
+
+                                                                  ]
+                                                }
+                   },
+    "total_capital":  290000
 }
