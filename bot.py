@@ -385,6 +385,11 @@ class PortfolioManager:
             return {
                 "status": "online",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "system_status": {
+                    "last_scan": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+                    "active_models": len(STRATEGY_ROSTER),
+                    "message": "Engine Active — Scanning 29 strategy models for entry criteria..."
+                },
                 "kpi": {
                     "initial_capital": round(initial_capital, 2),
                     "current_capital": round(current_capital, 2),
