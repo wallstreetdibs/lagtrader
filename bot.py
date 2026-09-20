@@ -29,8 +29,14 @@ HISTORY_PATH = os.path.join(DATA_DIR, "trade_history.csv")
 
 HTTP_PORT = int(os.environ.get("PORT", 8080))
 
-# TwelveData API Key (configured as default backup to Yahoo Finance)
-TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "e5412639c4844ff8b877be3f53b69c9d")
+# TwelveData API Keys (Supports automatic primary & secondary failover rotation)
+TWELVEDATA_KEYS = [
+    k for k in [
+        os.environ.get("TWELVEDATA_KEY"),
+        os.environ.get("TWELVEDATA_KEY2"),
+        os.environ.get("TWELVEDATA_API_KEY")  # Fallback for legacy key name if present
+    ] if k
+]
 
 # GitHub Persistence Configuration
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "wallstreetdibs/lagtrader")
@@ -221,24 +227,28 @@ def is_market_open(market_name: str, for_entry: bool = False, now: datetime = No
     return open_h <= utc_hour <= close_h
 
 # =====================================================================
-# Pricing & Intraday High/Low Engine
+# Pricing & TwelveData Key Rotation Engine
 # =====================================================================
 
-def fetch_twelvedata_price(ticker: str, api_key: str):
-    if not api_key:
+def fetch_twelvedata_price(ticker: str):
+    if not TWELVEDATA_KEYS:
         return None
-    try:
-        clean_sym = ticker.split(".")[0]
-        url = f"https://api.twelvedata.com/price?symbol={clean_sym}&apikey={api_key}"
-        req = urllib.request.Request(url, headers={"User-Agent": "LagTrader/1.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if "price" in data:
-                val = float(data["price"])
-                if val > 0:
-                    return round(val, 2)
-    except Exception:
-        pass
+    clean_sym = ticker.split(".")[0]
+    for api_key in TWELVEDATA_KEYS:
+        try:
+            url = f"https://api.twelvedata.com/price?symbol={clean_sym}&apikey={api_key}"
+            req = urllib.request.Request(url, headers={"User-Agent": "LagTrader/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if "price" in data:
+                    val = float(data["price"])
+                    if val > 0:
+                        return round(val, 2)
+                elif data.get("code") == 429:
+                    # Rate limit hit on this key, rotate to next available key
+                    continue
+        except Exception:
+            continue
     return None
 
 def fetch_live_price(ticker: str):
@@ -259,18 +269,13 @@ def fetch_live_price(ticker: str):
         except Exception:
             pass
 
-    if TWELVEDATA_API_KEY:
-        td_price = fetch_twelvedata_price(ticker, TWELVEDATA_API_KEY)
-        if td_price is not None and td_price > 0:
-            return td_price
+    td_price = fetch_twelvedata_price(ticker)
+    if td_price is not None and td_price > 0:
+        return td_price
 
     return None
 
 def fetch_intraday_ohlc(ticker: str):
-    """
-    Fetches the latest intraday bar (including High and Low ticks) 
-    to power worst-tick TP/SL execution checks.
-    """
     if YFINANCE_AVAILABLE and ticker:
         try:
             t = yf.Ticker(ticker)
@@ -286,7 +291,6 @@ def fetch_intraday_ohlc(ticker: str):
         except Exception:
             pass
             
-    # Fallback if OHLC candle fails: synthesize flat range from scalar live price
     p = fetch_live_price(ticker)
     if p:
         return {"open": p, "high": p, "low": p, "close": p}
@@ -585,7 +589,7 @@ def start_server(port=HTTP_PORT):
     print(f"[SERVER] Listening on port {port} (GET /api/data & POST /api/signal)")
 
 # =====================================================================
-# Execution Engine (With Slippage Buffer & Worst-Tick Exit Modeling)
+# Execution Engine
 # =====================================================================
 
 class ExecutionEngine:
@@ -615,8 +619,7 @@ class ExecutionEngine:
         raw_entry = float(signal_payload.get("entry_price", 100.0))
         direction = signal_payload.get("direction", "BUY").upper()
         
-        # APPLY SLIPPAGE BUFFER UPON ENTRY:
-        # BUY fills higher (crossing ask), SELL fills lower (crossing bid)
+        # Slippage Buffer
         if direction in ["BUY", "LONG"]:
             entry_price = round(raw_entry * (1.0 + SLIPPAGE_PCT), 2)
         else:
@@ -634,7 +637,6 @@ class ExecutionEngine:
         available_cash = strat_dict.get("cash", 10000.0)
 
         if available_cash < required_capital:
-            print(f"❌ [ORDER REJECTED] {strat_name}: Insufficient cash (Required: ${required_capital}, Available: ${available_cash})")
             return False, f"Insufficient cash: Required ${required_capital:.2f}, Available ${available_cash:.2f}"
 
         strat_dict["cash"] = round(available_cash - required_capital, 2)
@@ -660,9 +662,6 @@ class ExecutionEngine:
 
         strat_dict["positions"].append(position_record)
         self.portfolio_mgr.save()
-
-        ttt_str = format_trigger_time(signal_time, action_time)
-        print(f"[{order_status}] {strat_name} | {direction} {action_ticker} ({action_market}) | Cost: ${required_capital} | Cash Left: ${strat_dict['cash']} | TP: {tp} | SL: {sl} | Trigger: {ttt_str}")
         return True, f"Order {position_record['order_id']} placed ({order_status})"
 
     def process_pending_queues(self):
@@ -688,7 +687,6 @@ class ExecutionEngine:
                                 current_945_price = ohlc["open"]
                                 old_entry = pos.get("entry_price", current_945_price)
                                 
-                                # GAP-HOLD CONFIRMATION FILTER
                                 is_trap = False
                                 if direction in ["BUY", "LONG"] and current_945_price < old_entry * 0.985:
                                     is_trap = True
@@ -699,10 +697,8 @@ class ExecutionEngine:
                                     refund = pos.get("invested_capital", old_entry * pos["qty"])
                                     strat_info["cash"] = round(strat_info.get("cash", 0.0) + refund, 2)
                                     updated = True
-                                    print(f"🛡️ [GAP TRAP CANCELLED] {strat_name} ({direction} {ticker}): Opening move collapsed by 9:45 AM. Refunded ${refund} to cash!")
                                     continue
 
-                                # Apply execution slippage on 9:45 AM fill
                                 if direction in ["BUY", "LONG"]:
                                     executed_price = round(current_945_price * (1.0 + SLIPPAGE_PCT), 2)
                                 else:
@@ -723,8 +719,6 @@ class ExecutionEngine:
                             pos["status"] = "ACTIVE"
                             pos["action_time"] = datetime.now(timezone.utc).isoformat()
                             updated = True
-                            ttt_str = format_trigger_time(pos.get("signal_time"), pos.get("action_time"))
-                            print(f"⚡ [9:45 AM EXECUTED] {direction} {ticker} entered at ${pos['entry_price']}. Pull Trigger Time: {ttt_str}")
 
                     remaining_positions.append(pos)
                 strat_info["positions"] = remaining_positions
@@ -733,10 +727,6 @@ class ExecutionEngine:
             self.portfolio_mgr.save()
 
     def check_active_positions_tp_sl(self):
-        """
-        Monitors open positions continuously using Worst-Tick High/Low 
-        intra-bar verification to ensure stops and targets aren't missed.
-        """
         positions_to_close = []
 
         with self.portfolio_mgr.lock:
@@ -762,26 +752,19 @@ class ExecutionEngine:
 
                         bar_high = ohlc["high"]
                         bar_low = ohlc["low"]
-                        bar_close = ohlc["close"]
 
                         direction = pos.get("direction", "BUY").upper()
                         tp = pos.get("tp_price", 999999)
                         sl = pos.get("sl_price", 0)
 
                         if direction in ["BUY", "LONG"]:
-                            # WORST-TICK CHECK FOR LONG POSITIONS:
-                            # Check if Low breached stop-loss first (conservative assumption), 
-                            # or if High reached take-profit target.
                             if bar_low <= sl:
-                                # Stopped out: apply slippage penalty to stop exit
                                 exit_price = round(min(sl, bar_low) * (1.0 - SLIPPAGE_PCT), 2)
                                 positions_to_close.append((strat_name, ticker, exit_price, "STOP_LOSS"))
                             elif bar_high >= tp:
-                                # Take profit hit: apply slippage buffer to target exit
                                 exit_price = round(max(tp, bar_high) * (1.0 - SLIPPAGE_PCT), 2)
                                 positions_to_close.append((strat_name, ticker, exit_price, "TAKE_PROFIT"))
                         else:
-                            # WORST-TICK CHECK FOR SHORT POSITIONS:
                             if bar_high >= sl:
                                 exit_price = round(max(sl, bar_high) * (1.0 + SLIPPAGE_PCT), 2)
                                 positions_to_close.append((strat_name, ticker, exit_price, "STOP_LOSS"))
@@ -836,7 +819,7 @@ class ExecutionEngine:
                             reason
                         ])
 
-                    print(f"🎯 [TRADE CLOSED] {strat_name} ({direction} {ticker}) at ${exit_price} | Net PnL: ${net_pnl} | Return: ${returned_total} | New Cash: ${strat_info['cash']} | Trigger Time: {ttt_str}")
+                    print(f"🎯 [TRADE CLOSED] {strat_name} ({direction} {ticker}) at ${exit_price} | Net PnL: ${net_pnl}")
                 else:
                     remaining.append(pos)
 
@@ -861,25 +844,7 @@ class ExecutionEngine:
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    print("🚀 LagTrader Engine Running (29 Models). Slippage Buffer & Worst-Tick Engine Active.")
-
-    test_signal = {
-        "strategy": "SKHY_ADR_FX_Neutralization",
-        "signal_ticker": "000660.KS",
-        "signal_market": "KOSPI",
-        "action_ticker": "HXSCL",
-        "action_market": "NYSE",
-        "direction": "BUY",
-        "qty": 200,
-        "entry_price": 18.45,
-        "discrepancy_pct": 2.1,
-        "beta": 1.15,
-        "atr_14": 0.35,
-        "signal_time": datetime.now(timezone.utc).isoformat()
-    }
-
-    engine.process_signal(test_signal)
-    engine.process_pending_queues()
+    print("🚀 LagTrader Engine Running (29 Models). TwelveData Key Rotation & GitHub CSV Sync Active.")
 
     while True:
         try:
