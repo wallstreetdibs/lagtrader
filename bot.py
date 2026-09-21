@@ -6,10 +6,14 @@ import csv
 import queue
 import threading
 import base64
+import socket
 import urllib.request
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, date
+
+# Enforce global socket timeout to prevent hung API requests from freezing execution threads
+socket.setdefaulttimeout(8)
 
 try:
     import pandas as pd
@@ -46,7 +50,7 @@ TWELVEDATA_KEYS = [
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "wallstreetdibs/lagtrader")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
-# Realistic Execution Slippage Buffer (0.05% friction)
+# Execution Slippage Buffer (0.05% friction)
 SLIPPAGE_PCT = 0.0005
 
 STRATEGY_ROSTER = [
@@ -94,11 +98,11 @@ ENTRY_HOURS_UTC = {
     "CRYPTO": (0.0, 24.0)
 }
 
-# Thread lock for file and CSV system access
-CSV_LOCK = threading.Lock()
+# Unified Thread Lock for file and state operations
+FILE_LOCK = threading.Lock()
 
 # =====================================================================
-# Sequential GitHub Persistence Worker (Prevents API Commit Race Conditions)
+# GitHub Persistence Worker
 # =====================================================================
 
 class GitHubSyncWorker:
@@ -140,14 +144,14 @@ class GitHubSyncWorker:
         sha = None
         try:
             req = urllib.request.Request(api_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 sha = data.get("sha")
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 print(f"[GITHUB SYNC] SHA lookup error: {e}")
 
-        with CSV_LOCK:
+        with FILE_LOCK:
             with open(file_path, "rb") as f:
                 content_bytes = f.read()
 
@@ -159,7 +163,7 @@ class GitHubSyncWorker:
         put_req = urllib.request.Request(
             api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT"
         )
-        with urllib.request.urlopen(put_req, timeout=12):
+        with urllib.request.urlopen(put_req, timeout=10):
             print(f"📦 [GITHUB SYNC] Auto-committed {filename} successfully.")
 
 def pull_file_from_github(file_path: str, repo: str, token: str):
@@ -175,14 +179,15 @@ def pull_file_from_github(file_path: str, repo: str, token: str):
             "User-Agent": "LagTrader-Bot"
         }
         req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             content_b64 = data.get("content", "")
             if content_b64:
                 file_bytes = base64.b64decode(content_b64)
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                with open(file_path, "wb") as f:
-                    f.write(file_bytes)
+                with FILE_LOCK:
+                    with open(file_path, "wb") as f:
+                        f.write(file_bytes)
                 print(f"📥 [GITHUB SYNC] Restored {filename} from remote repository!")
                 return True
     except Exception:
@@ -192,7 +197,7 @@ def pull_file_from_github(file_path: str, repo: str, token: str):
 GITHUB_WORKER = GitHubSyncWorker(GITHUB_REPO, GITHUB_TOKEN)
 
 # =====================================================================
-# Market Calendar & US Holiday Intelligence
+# Market Calendar Intelligence
 # =====================================================================
 
 def is_us_holiday(d: date) -> bool:
@@ -227,11 +232,9 @@ def is_market_open(market_name: str, for_entry: bool = False, now: datetime = No
     weekday = now.weekday()
     utc_hour = now.hour + (now.minute / 60.0)
 
-    # Saturday
     if weekday == 5:
         return False
 
-    # Sunday checks
     if weekday == 6:
         if market == "CME":
             return utc_hour >= 22.0
@@ -239,11 +242,9 @@ def is_market_open(market_name: str, for_entry: bool = False, now: datetime = No
             return utc_hour >= 23.0
         return False
 
-    # Friday evening CME closure
     if weekday == 4 and market == "CME" and utc_hour >= 21.0:
         return False
 
-    # Friday evening ASX closure (Sydney Saturday Morning)
     if weekday == 4 and market == "ASX" and utc_hour >= 21.0:
         return False
 
@@ -269,7 +270,6 @@ def fetch_twelvedata_price(ticker: str):
     if not TWELVEDATA_KEYS or not ticker:
         return None
 
-    # Preserve exchange extensions for non-US symbols
     td_ticker = ticker.replace("=", "/").strip()
     for api_key in TWELVEDATA_KEYS:
         try:
@@ -345,7 +345,7 @@ def ensure_environment():
         pull_file_from_github(HISTORY_PATH, GITHUB_REPO, GITHUB_TOKEN)
 
     if not os.path.exists(HISTORY_PATH):
-        with CSV_LOCK:
+        with FILE_LOCK:
             with open(HISTORY_PATH, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([
@@ -376,8 +376,13 @@ def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
     if not signal_time_iso or not isinstance(signal_time_iso, str):
         return "N/A"
     try:
-        t_sig = datetime.fromisoformat(signal_time_iso)
-        t_act = datetime.fromisoformat(action_time_iso) if action_time_iso else datetime.now(timezone.utc)
+        sig_str = signal_time_iso.replace("Z", "+00:00")
+        t_sig = datetime.fromisoformat(sig_str)
+        if action_time_iso:
+            act_str = action_time_iso.replace("Z", "+00:00")
+            t_act = datetime.fromisoformat(act_str)
+        else:
+            t_act = datetime.now(timezone.utc)
         elapsed_sec = max(0, int((t_act - t_sig).total_seconds()))
         hours = elapsed_sec // 3600
         minutes = (elapsed_sec % 3600) // 60
@@ -404,13 +409,14 @@ class PortfolioManager:
         with self.lock:
             if os.path.exists(self.filepath):
                 try:
-                    with open(self.filepath, "r") as f:
-                        data = json.load(f)
-                        self._reconcile_roster(data)
-                        return data
+                    with FILE_LOCK:
+                        with open(self.filepath, "r") as f:
+                            data = json.load(f)
+                    self._reconcile_roster(data)
+                    return data
                 except Exception as e:
                     print(f"[WARN] Failed to parse portfolio JSON: {e}. Resetting to default state.")
-            
+
             default_state = self._build_default_state()
             self._save_unlocked(default_state)
             GITHUB_WORKER.enqueue_sync(self.filepath, "Initialize portfolio state")
@@ -431,8 +437,9 @@ class PortfolioManager:
 
     def _save_unlocked(self, data_to_save=None):
         payload = data_to_save or self.data
-        with open(self.filepath, "w") as f:
-            json.dump(payload, f, indent=2)
+        with FILE_LOCK:
+            with open(self.filepath, "w") as f:
+                json.dump(payload, f, indent=2)
 
     def save(self):
         with self.lock:
@@ -441,7 +448,7 @@ class PortfolioManager:
     def get_strategy_stats(self):
         stats = {strat: {"wins": 0, "losses": 0, "win_rate": 0.0, "realized_pnl": 0.0} for strat in STRATEGY_ROSTER}
         if os.path.exists(HISTORY_PATH):
-            with CSV_LOCK:
+            with FILE_LOCK:
                 try:
                     if pd is not None:
                         df = pd.read_csv(HISTORY_PATH)
@@ -522,7 +529,7 @@ class PortfolioManager:
 
                 recent_trades = []
                 if os.path.exists(HISTORY_PATH):
-                    with CSV_LOCK:
+                    with FILE_LOCK:
                         try:
                             if pd is not None:
                                 df = pd.read_csv(HISTORY_PATH)
@@ -549,7 +556,7 @@ class PortfolioManager:
                 return {
                     "status": "online",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "kpi": {"total_capital": 290000.0, "total_wins": 0, "total_losses": 0, "win_rate": 0.0},
+                    "kpi": {"total_capital": float(len(STRATEGY_ROSTER) * 10000.0), "total_wins": 0, "total_losses": 0, "win_rate": 0.0},
                     "orders": [],
                     "recent_trades": [],
                     "strategies": [{"name": s, "wins": 0, "losses": 0, "win_rate": 0.0, "allocated": 10000.0, "cash": 10000.0} for s in STRATEGY_ROSTER]
@@ -596,7 +603,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
 
             elif parsed_path == "/api/backup":
                 if os.path.exists(HISTORY_PATH):
-                    with CSV_LOCK:
+                    with FILE_LOCK:
                         with open(HISTORY_PATH, "rb") as f:
                             data = f.read()
                     self.send_response(200)
@@ -609,7 +616,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_json_response(404, {"status": "error", "message": "No trade history available."})
 
-            else:
+            else: # Catches /, /health, and health checks from Render
                 self._send_json_response(200, {
                     "status": "online", "system": "LagTrader Engine", "timestamp": datetime.now(timezone.utc).isoformat()
                 })
@@ -682,7 +689,7 @@ class ExecutionEngine:
         action_time = datetime.now(timezone.utc).isoformat() if entry_window_open else None
 
         raw_entry = float(signal_payload.get("entry_price", 100.0))
-        direction = signal_payload.get("direction", "BUY").upper()
+        direction = str(signal_payload.get("direction", "BUY")).upper()
 
         if direction in ["BUY", "LONG"]:
             entry_price = round(raw_entry * (1.0 + SLIPPAGE_PCT), 2)
@@ -709,7 +716,7 @@ class ExecutionEngine:
             tp, sl = calculate_dynamic_tp_sl(entry_price, discrepancy, beta, atr_14, direction)
 
             position_record = {
-                "order_id": f"ORD_{int(time.time()*1000)}",
+                "order_id": f"ORD_{int(time.time()*1000000)}",
                 "status": order_status,
                 "strategy": strat_name,
                 "signal_ticker": signal_payload.get("signal_ticker", "-"),
@@ -736,6 +743,29 @@ class ExecutionEngine:
         return True, f"Order {position_record['order_id']} placed ({order_status})"
 
     def process_pending_queues(self):
+        # 1. Read pending tickers outside network call
+        pending_tickers = set()
+        with self.portfolio_mgr.lock:
+            for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
+                if not isinstance(strat_info, dict):
+                    continue
+                for pos in strat_info.get("positions", []):
+                    if isinstance(pos, dict) and pos.get("status") == "PENDING_MARKET_OPEN":
+                        action_mkt = pos.get("action_market", "NYSE")
+                        if is_market_open(action_mkt, for_entry=True):
+                            ticker = pos.get("action_ticker")
+                            if ticker:
+                                pending_tickers.add(ticker)
+
+        if not pending_tickers:
+            return
+
+        # 2. Fetch price data without holding portfolio lock
+        ohlc_cache = {}
+        for ticker in pending_tickers:
+            ohlc_cache[ticker] = fetch_intraday_ohlc(ticker)
+
+        # 3. Update pending positions state
         updated = False
         with self.portfolio_mgr.lock:
             for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
@@ -751,10 +781,10 @@ class ExecutionEngine:
 
                         if is_market_open(action_mkt, for_entry=True):
                             ticker = pos.get("action_ticker")
-                            direction = pos.get("direction", "BUY").upper()
-                            ohlc = fetch_intraday_ohlc(ticker)
+                            direction = str(pos.get("direction", "BUY")).upper()
+                            ohlc = ohlc_cache.get(ticker)
 
-                            if ohlc and ohlc["open"] > 0:
+                            if ohlc and ohlc.get("open", 0) > 0:
                                 current_open_price = ohlc["open"]
                                 old_entry = pos.get("entry_price", current_open_price)
 
@@ -804,8 +834,30 @@ class ExecutionEngine:
             GITHUB_WORKER.enqueue_sync(PORTFOLIO_PATH, "Activated pending market orders")
 
     def check_active_positions_tp_sl(self):
-        positions_to_close = []
+        # 1. Read active tickers outside network call
+        active_tickers = set()
+        with self.portfolio_mgr.lock:
+            for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
+                if not isinstance(strat_info, dict):
+                    continue
+                for pos in strat_info.get("positions", []):
+                    if isinstance(pos, dict) and pos.get("status") == "ACTIVE":
+                        action_mkt = pos.get("action_market", "NYSE")
+                        if is_market_open(action_mkt, for_entry=False):
+                            ticker = pos.get("action_ticker") or pos.get("ticker")
+                            if ticker:
+                                active_tickers.add(ticker)
 
+        if not active_tickers:
+            return
+
+        # 2. Fetch prices without holding portfolio lock
+        price_cache = {}
+        for ticker in active_tickers:
+            price_cache[ticker] = fetch_live_price(ticker)
+
+        # 3. Queue positions targeting precise order_id for execution
+        positions_to_close = []
         with self.portfolio_mgr.lock:
             for strat_name, strat_info in self.portfolio_mgr.data.get("strategies", {}).items():
                 if not isinstance(strat_info, dict):
@@ -823,45 +875,50 @@ class ExecutionEngine:
                         if not ticker:
                             continue
 
-                        live_price = fetch_live_price(ticker)
+                        live_price = price_cache.get(ticker)
                         if live_price is None or live_price <= 0:
                             continue
 
-                        direction = pos.get("direction", "BUY").upper()
+                        direction = str(pos.get("direction", "BUY")).upper()
                         tp = pos.get("tp_price", 999999)
                         sl = pos.get("sl_price", 0)
+                        order_id = pos.get("order_id")
 
                         if direction in ["BUY", "LONG"]:
                             if live_price <= sl:
                                 exit_price = round(live_price * (1.0 - SLIPPAGE_PCT), 2)
-                                positions_to_close.append((strat_name, ticker, exit_price, "STOP_LOSS"))
+                                positions_to_close.append((strat_name, order_id, ticker, exit_price, "STOP_LOSS"))
                             elif live_price >= tp:
                                 exit_price = round(live_price * (1.0 - SLIPPAGE_PCT), 2)
-                                positions_to_close.append((strat_name, ticker, exit_price, "TAKE_PROFIT"))
+                                positions_to_close.append((strat_name, order_id, ticker, exit_price, "TAKE_PROFIT"))
                         else:
                             if live_price >= sl:
                                 exit_price = round(live_price * (1.0 + SLIPPAGE_PCT), 2)
-                                positions_to_close.append((strat_name, ticker, exit_price, "STOP_LOSS"))
+                                positions_to_close.append((strat_name, order_id, ticker, exit_price, "STOP_LOSS"))
                             elif live_price <= tp:
                                 exit_price = round(live_price * (1.0 + SLIPPAGE_PCT), 2)
-                                positions_to_close.append((strat_name, ticker, exit_price, "TAKE_PROFIT"))
+                                positions_to_close.append((strat_name, order_id, ticker, exit_price, "TAKE_PROFIT"))
 
-        for strat_name, ticker, exit_price, reason in positions_to_close:
-            self.close_position(strat_name, ticker, exit_price, reason)
+        for strat_name, order_id, ticker, exit_price, reason in positions_to_close:
+            self.close_position_by_id(strat_name, order_id, exit_price, reason)
 
-    def close_position(self, strat_name: str, action_ticker: str, exit_price: float, reason: str = "TAKE_PROFIT"):
+    def close_position_by_id(self, strat_name: str, order_id: str, exit_price: float, reason: str = "TAKE_PROFIT"):
         with self.portfolio_mgr.lock:
             strat_info = self.portfolio_mgr.data["strategies"].get(strat_name)
             if not strat_info:
                 return
 
             remaining = []
+            action_ticker_closed = None
+
             for pos in strat_info.get("positions", []):
-                ticker = pos.get("action_ticker") or pos.get("ticker")
-                if ticker == action_ticker and pos.get("status") == "ACTIVE":
+                p_id = pos.get("order_id")
+                if p_id == order_id and pos.get("status") == "ACTIVE":
+                    ticker = pos.get("action_ticker") or pos.get("ticker", "UNKNOWN")
+                    action_ticker_closed = ticker
                     qty = pos.get("qty", 100)
                     entry_price = pos.get("entry_price", exit_price)
-                    direction = pos.get("direction", "BUY").upper()
+                    direction = str(pos.get("direction", "BUY")).upper()
 
                     multiplier = 1 if direction in ["BUY", "LONG"] else -1
                     gross_pnl = round((exit_price - entry_price) * qty * multiplier, 2)
@@ -876,7 +933,7 @@ class ExecutionEngine:
                     act_time = pos.get("action_time")
                     ttt_str = format_trigger_time(sig_time, act_time)
 
-                    with CSV_LOCK:
+                    with FILE_LOCK:
                         with open(HISTORY_PATH, "a", newline="") as f:
                             writer = csv.writer(f)
                             writer.writerow([
@@ -894,23 +951,24 @@ class ExecutionEngine:
                                 reason
                             ])
 
-                    print(f"🎯 [TRADE CLOSED] {strat_name} ({direction} {ticker}) at ${exit_price} | Net PnL:${net_pnl}")
+                    print(f"🎯 [TRADE CLOSED] {strat_name} ({direction} {ticker} Order:{order_id}) at ${exit_price} | Net PnL:${net_pnl}")
                 else:
                     remaining.append(pos)
 
             strat_info["positions"] = remaining
             self.portfolio_mgr._save_unlocked()
 
-        GITHUB_WORKER.enqueue_sync(HISTORY_PATH, f"Closed {action_ticker} ({reason})")
-        GITHUB_WORKER.enqueue_sync(PORTFOLIO_PATH, f"Portfolio update after closing {action_ticker}")
+        if action_ticker_closed:
+            GITHUB_WORKER.enqueue_sync(HISTORY_PATH, f"Closed {action_ticker_closed} ({reason})")
+            GITHUB_WORKER.enqueue_sync(PORTFOLIO_PATH, f"Portfolio update after closing {action_ticker_closed}")
 
 # =====================================================================
-# Main Execution Loop
+# Main Engine Loop
 # =====================================================================
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    print("🚀 LagTrader Engine Running (29 Models). Sequential GitHub Persistence & Thread-Safe Core Active.")
+    print("🚀 LagTrader Engine Running (29 Models). Production Architecture Active.")
 
     while True:
         try:
@@ -918,4 +976,4 @@ if __name__ == "__main__":
             engine.check_active_positions_tp_sl()
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
-        time.sleep(60)
+        time.sleep(30)
