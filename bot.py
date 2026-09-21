@@ -3,14 +3,18 @@ import sys
 import json
 import time
 import csv
-import zipfile
+import queue
 import threading
 import base64
 import urllib.request
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, date
-import pandas as pd
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 try:
     import yfinance as yf
@@ -34,7 +38,7 @@ TWELVEDATA_KEYS = [
     k for k in [
         os.environ.get("TWELVEDATA_KEY"),
         os.environ.get("TWELVEDATA_KEY2"),
-        os.environ.get("TWELVEDATA_API_KEY")  # Fallback for legacy key name if present
+        os.environ.get("TWELVEDATA_API_KEY")
     ] if k
 ]
 
@@ -58,21 +62,20 @@ STRATEGY_ROSTER = [
     "Crypto_Weekend_Gap_Run", "SoftBank_ARM_Nexus"
 ]
 
-# Market Operating Hours (UTC)
 EXCHANGE_HOURS_UTC = {
     "NYSE": (13.5, 20.0),    # 9:30 AM - 4:00 PM US Eastern
     "NASDAQ": (13.5, 20.0),
-    "TSX": (13.5, 20.0),     # Toronto
-    "XETR": (7.0, 15.5),     # Frankfurt
-    "LSE": (7.0, 15.5),      # London
-    "AMS": (7.0, 15.5),      # Euronext Amsterdam (ASML)
-    "OMX": (7.0, 15.0),      # Nordic / Copenhagen (Novo Nordisk)
-    "TSE": (0.0, 6.5),       # Tokyo (SoftBank, Nikkei)
-    "KOSPI": (0.0, 6.5),     # Seoul (SK Hynix, Samsung)
-    "TWSE": (1.0, 5.5),      # Taiwan (TSMC 2330.TW)
-    "ASX": (23.0, 6.0),      # Sydney (Opens 23:00 UTC Sunday to 06:00 UTC)
-    "CME": (0.0, 24.0),      # Futures
-    "CRYPTO": (0.0, 24.0)    # 24/7
+    "TSX": (13.5, 20.0),
+    "XETR": (7.0, 15.5),
+    "LSE": (7.0, 15.5),
+    "AMS": (7.0, 15.5),
+    "OMX": (7.0, 15.0),
+    "TSE": (0.0, 6.5),
+    "KOSPI": (0.0, 6.5),
+    "TWSE": (1.0, 5.5),
+    "ASX": (23.0, 6.0),
+    "CME": (0.0, 24.0),
+    "CRYPTO": (0.0, 24.0)
 }
 
 ENTRY_HOURS_UTC = {
@@ -91,9 +94,73 @@ ENTRY_HOURS_UTC = {
     "CRYPTO": (0.0, 24.0)
 }
 
+# Thread lock for file and CSV system access
+CSV_LOCK = threading.Lock()
+
 # =====================================================================
-# GitHub Automatic State Persistence
+# Sequential GitHub Persistence Worker (Prevents API Commit Race Conditions)
 # =====================================================================
+
+class GitHubSyncWorker:
+    def __init__(self, repo: str, token: str):
+        self.repo = repo
+        self.token = token
+        self.queue = queue.Queue()
+        self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
+        if self.repo and self.token:
+            self.worker_thread.start()
+
+    def enqueue_sync(self, file_path: str, commit_msg: str):
+        if not self.repo or not self.token:
+            return
+        self.queue.put((file_path, commit_msg))
+
+    def _process_queue(self):
+        while True:
+            file_path, commit_msg = self.queue.get()
+            try:
+                self._sync_file_now(file_path, commit_msg)
+            except Exception as e:
+                print(f"[GITHUB SYNC ERROR] {e}")
+            finally:
+                self.queue.task_done()
+
+    def _sync_file_now(self, file_path: str, commit_msg: str):
+        if not os.path.exists(file_path):
+            return
+        filename = os.path.basename(file_path)
+        repo_path = f"data/{filename}"
+        api_url = f"https://api.github.com/repos/{self.repo}/contents/{repo_path}"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "LagTrader-Bot"
+        }
+
+        sha = None
+        try:
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                sha = data.get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print(f"[GITHUB SYNC] SHA lookup error: {e}")
+
+        with CSV_LOCK:
+            with open(file_path, "rb") as f:
+                content_bytes = f.read()
+
+        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
+        payload = {"message": commit_msg, "content": content_b64}
+        if sha:
+            payload["sha"] = sha
+
+        put_req = urllib.request.Request(
+            api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT"
+        )
+        with urllib.request.urlopen(put_req, timeout=12):
+            print(f"📦 [GITHUB SYNC] Auto-committed {filename} successfully.")
 
 def pull_file_from_github(file_path: str, repo: str, token: str):
     if not repo or not token:
@@ -108,7 +175,7 @@ def pull_file_from_github(file_path: str, repo: str, token: str):
             "User-Agent": "LagTrader-Bot"
         }
         req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             content_b64 = data.get("content", "")
             if content_b64:
@@ -116,52 +183,13 @@ def pull_file_from_github(file_path: str, repo: str, token: str):
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
                 with open(file_path, "wb") as f:
                     f.write(file_bytes)
-                print(f"📥 [GITHUB SYNC] Restored latest {filename} from GitHub repository!")
+                print(f"📥 [GITHUB SYNC] Restored {filename} from remote repository!")
                 return True
     except Exception:
         pass
     return False
 
-def sync_file_to_github(file_path: str, repo: str, token: str, commit_msg: str):
-    if not repo or not token or not os.path.exists(file_path):
-        return False
-    try:
-        filename = os.path.basename(file_path)
-        repo_path = f"data/{filename}"
-        api_url = f"https://api.github.com/repos/{repo}/contents/{repo_path}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "LagTrader-Bot"
-        }
-
-        sha = None
-        try:
-            req = urllib.request.Request(api_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                sha = data.get("sha")
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                print(f"[GITHUB SYNC] Error looking up SHA: {e}")
-
-        with open(file_path, "rb") as f:
-            content_bytes = f.read()
-        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
-
-        payload = {"message": commit_msg, "content": content_b64}
-        if sha:
-            payload["sha"] = sha
-
-        put_req = urllib.request.Request(
-            api_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT"
-        )
-        with urllib.request.urlopen(put_req, timeout=10):
-            print(f"📦 [GITHUB SYNC] Successfully auto-committed {filename} to GitHub!")
-            return True
-    except Exception as e:
-        print(f"[GITHUB SYNC ERROR] {e}")
-        return False
+GITHUB_WORKER = GitHubSyncWorker(GITHUB_REPO, GITHUB_TOKEN)
 
 # =====================================================================
 # Market Calendar & US Holiday Intelligence
@@ -199,9 +227,11 @@ def is_market_open(market_name: str, for_entry: bool = False, now: datetime = No
     weekday = now.weekday()
     utc_hour = now.hour + (now.minute / 60.0)
 
+    # Saturday
     if weekday == 5:
         return False
 
+    # Sunday checks
     if weekday == 6:
         if market == "CME":
             return utc_hour >= 22.0
@@ -209,7 +239,12 @@ def is_market_open(market_name: str, for_entry: bool = False, now: datetime = No
             return utc_hour >= 23.0
         return False
 
+    # Friday evening CME closure
     if weekday == 4 and market == "CME" and utc_hour >= 21.0:
+        return False
+
+    # Friday evening ASX closure (Sydney Saturday Morning)
+    if weekday == 4 and market == "ASX" and utc_hour >= 21.0:
         return False
 
     if market in ["NYSE", "NASDAQ"] and is_us_holiday(now.date()):
@@ -231,12 +266,14 @@ def is_market_open(market_name: str, for_entry: bool = False, now: datetime = No
 # =====================================================================
 
 def fetch_twelvedata_price(ticker: str):
-    if not TWELVEDATA_KEYS:
+    if not TWELVEDATA_KEYS or not ticker:
         return None
-    clean_sym = ticker.split(".")[0]
+
+    # Preserve exchange extensions for non-US symbols
+    td_ticker = ticker.replace("=", "/").strip()
     for api_key in TWELVEDATA_KEYS:
         try:
-            url = f"https://api.twelvedata.com/price?symbol={clean_sym}&apikey={api_key}"
+            url = f"https://api.twelvedata.com/price?symbol={urllib.parse.quote(td_ticker)}&apikey={api_key}"
             req = urllib.request.Request(url, headers={"User-Agent": "LagTrader/1.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -245,7 +282,6 @@ def fetch_twelvedata_price(ticker: str):
                     if val > 0:
                         return round(val, 2)
                 elif data.get("code") == 429:
-                    # Rate limit hit on this key, rotate to next available key
                     continue
         except Exception:
             continue
@@ -290,7 +326,7 @@ def fetch_intraday_ohlc(ticker: str):
                 }
         except Exception:
             pass
-            
+
     p = fetch_live_price(ticker)
     if p:
         return {"open": p, "high": p, "low": p, "close": p}
@@ -309,13 +345,15 @@ def ensure_environment():
         pull_file_from_github(HISTORY_PATH, GITHUB_REPO, GITHUB_TOKEN)
 
     if not os.path.exists(HISTORY_PATH):
-        with open(HISTORY_PATH, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "timestamp", "strategy", "signal_ticker", "action_ticker",
-                "action", "qty", "price", "gross_pnl", "fee", "net_pnl",
-                "trigger_time", "reason"
-            ])
+        with CSV_LOCK:
+            with open(HISTORY_PATH, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "strategy", "signal_ticker", "action_ticker",
+                    "action", "qty", "price", "gross_pnl", "fee", "net_pnl",
+                    "trigger_time", "reason"
+                ])
+        GITHUB_WORKER.enqueue_sync(HISTORY_PATH, "Initial trade history creation")
 
 def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, beta: float = 1.0, atr_14: float = 0.50, direction: str = "BUY"):
     direction_clean = direction.upper()
@@ -331,7 +369,7 @@ def calculate_dynamic_tp_sl(entry_price: float, signal_discrepancy_pct: float, b
     else:
         tp_price = round(entry_price - tp_distance, 2)
         sl_price = round(entry_price + sl_distance, 2)
-        
+
     return tp_price, sl_price
 
 def format_trigger_time(signal_time_iso, action_time_iso=None) -> str:
@@ -363,15 +401,20 @@ class PortfolioManager:
         self.data = self.load()
 
     def load(self):
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r") as f:
-                    data = json.load(f)
-                    self._reconcile_roster(data)
-                    return data
-            except Exception as e:
-                print(f"[WARN] Error reading portfolio JSON: {e}. Resetting.")
-        return self._build_default_state()
+        with self.lock:
+            if os.path.exists(self.filepath):
+                try:
+                    with open(self.filepath, "r") as f:
+                        data = json.load(f)
+                        self._reconcile_roster(data)
+                        return data
+                except Exception as e:
+                    print(f"[WARN] Failed to parse portfolio JSON: {e}. Resetting to default state.")
+            
+            default_state = self._build_default_state()
+            self._save_unlocked(default_state)
+            GITHUB_WORKER.enqueue_sync(self.filepath, "Initialize portfolio state")
+            return default_state
 
     def _build_default_state(self):
         state = {"total_capital": float(len(STRATEGY_ROSTER) * 10000.0), "strategies": {}}
@@ -385,43 +428,60 @@ class PortfolioManager:
         for strat in STRATEGY_ROSTER:
             if strat not in data["strategies"] or not isinstance(data["strategies"][strat], dict):
                 data["strategies"][strat] = {"allocated": 10000.0, "cash": 10000.0, "positions": []}
-        data["total_capital"] = float(len(STRATEGY_ROSTER) * 10000.0)
+
+    def _save_unlocked(self, data_to_save=None):
+        payload = data_to_save or self.data
+        with open(self.filepath, "w") as f:
+            json.dump(payload, f, indent=2)
 
     def save(self):
         with self.lock:
-            with open(self.filepath, "w") as f:
-                json.dump(self.data, f, indent=2)
+            self._save_unlocked()
 
     def get_strategy_stats(self):
-        stats = {strat: {"wins": 0, "losses": 0, "win_rate": 0.0} for strat in STRATEGY_ROSTER}
+        stats = {strat: {"wins": 0, "losses": 0, "win_rate": 0.0, "realized_pnl": 0.0} for strat in STRATEGY_ROSTER}
         if os.path.exists(HISTORY_PATH):
-            try:
-                df = pd.read_csv(HISTORY_PATH)
-                if not df.empty and "strategy" in df.columns and "net_pnl" in df.columns:
-                    for strat, group in df.groupby("strategy"):
-                        wins = int((group["net_pnl"] > 0).sum())
-                        losses = int((group["net_pnl"] <= 0).sum())
-                        total = wins + losses
-                        win_rate = round((wins / total) * 100, 1) if total > 0 else 0.0
-                        stats[strat] = {"wins": wins, "losses": losses, "win_rate": win_rate}
-            except Exception as e:
-                print(f"[WARN] CSV parse failure: {e}")
+            with CSV_LOCK:
+                try:
+                    if pd is not None:
+                        df = pd.read_csv(HISTORY_PATH)
+                        if not df.empty and "strategy" in df.columns and "net_pnl" in df.columns:
+                            for strat, group in df.groupby("strategy"):
+                                wins = int((group["net_pnl"] > 0).sum())
+                                losses = int((group["net_pnl"] <= 0).sum())
+                                total_pnl = float(group["net_pnl"].sum())
+                                total = wins + losses
+                                win_rate = round((wins / total) * 100, 1) if total > 0 else 0.0
+                                stats[strat] = {
+                                    "wins": wins,
+                                    "losses": losses,
+                                    "win_rate": win_rate,
+                                    "realized_pnl": round(total_pnl, 2)
+                                }
+                except Exception as e:
+                    print(f"[WARN] CSV parse error: {e}")
         return stats
 
     def get_dashboard_payload(self):
-        try:
-            stats = self.get_strategy_stats()
-            total_wins = sum(s["wins"] for s in stats.values())
-            total_losses = sum(s["losses"] for s in stats.values())
-            total_trades = total_wins + total_losses
-            overall_win_rate = round((total_wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
+        with self.lock:
+            try:
+                stats = self.get_strategy_stats()
+                total_wins = sum(s["wins"] for s in stats.values())
+                total_losses = sum(s["losses"] for s in stats.values())
+                total_trades = total_wins + total_losses
+                overall_win_rate = round((total_wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
 
-            all_orders = []
-            with self.lock:
+                all_orders = []
                 strategies_data = self.data.get("strategies", {})
+                
+                dynamic_equity = 0.0
+
                 for strat_name, strat in strategies_data.items():
                     if not isinstance(strat, dict):
                         continue
+                    cash = float(strat.get("cash", 10000.0))
+                    dynamic_equity += cash
+
                     for pos in strat.get("positions", []):
                         if not isinstance(pos, dict):
                             continue
@@ -437,62 +497,66 @@ class PortfolioManager:
                         pos_copy["entry_price"] = round(float(pos.get("entry_price", 0.0)), 2)
                         pos_copy["tp_price"] = round(float(pos.get("tp_price", 0.0)), 2)
                         pos_copy["sl_price"] = round(float(pos.get("sl_price", 0.0)), 2)
-                        
+
                         sig_time = pos.get("signal_time") or pos.get("entry_time")
                         act_time = pos.get("action_time")
                         pos_copy["pull_trigger_time"] = format_trigger_time(sig_time, act_time)
                         all_orders.append(pos_copy)
+                        
+                        dynamic_equity += float(pos.get("invested_capital", pos_copy["entry_price"] * pos_copy["qty"]))
 
-            strat_list = []
-            for s in STRATEGY_ROSTER:
-                s_dict = self.data.get("strategies", {}).get(s, {})
-                allocated = s_dict.get("allocated", 10000.0) if isinstance(s_dict, dict) else 10000.0
-                cash = s_dict.get("cash", 10000.0) if isinstance(s_dict, dict) else 10000.0
-                s_stat = stats.get(s, {"wins": 0, "losses": 0, "win_rate": 0.0})
-                strat_list.append({
-                    "name": s,
-                    "wins": s_stat["wins"],
-                    "losses": s_stat["losses"],
-                    "win_rate": s_stat["win_rate"],
-                    "allocated": round(float(allocated), 2),
-                    "cash": round(float(cash), 2)
-                })
+                strat_list = []
+                for s in STRATEGY_ROSTER:
+                    s_dict = strategies_data.get(s, {})
+                    allocated = s_dict.get("allocated", 10000.0) if isinstance(s_dict, dict) else 10000.0
+                    cash = s_dict.get("cash", 10000.0) if isinstance(s_dict, dict) else 10000.0
+                    s_stat = stats.get(s, {"wins": 0, "losses": 0, "win_rate": 0.0})
+                    strat_list.append({
+                        "name": s,
+                        "wins": s_stat["wins"],
+                        "losses": s_stat["losses"],
+                        "win_rate": s_stat["win_rate"],
+                        "allocated": round(float(allocated), 2),
+                        "cash": round(float(cash), 2)
+                    })
 
-            recent_trades = []
-            if os.path.exists(HISTORY_PATH):
-                try:
-                    df = pd.read_csv(HISTORY_PATH)
-                    if not df.empty:
-                        recent_trades = df.tail(5).to_dict(orient="records")
-                        recent_trades.reverse()
-                except Exception:
-                    pass
+                recent_trades = []
+                if os.path.exists(HISTORY_PATH):
+                    with CSV_LOCK:
+                        try:
+                            if pd is not None:
+                                df = pd.read_csv(HISTORY_PATH)
+                                if not df.empty:
+                                    recent_trades = df.tail(10).to_dict(orient="records")
+                                    recent_trades.reverse()
+                        except Exception:
+                            pass
 
-            return {
-                "status": "online",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "kpi": {
-                    "total_capital": round(float(self.data.get("total_capital", 290000.0)), 2),
-                    "total_wins": total_wins,
-                    "total_losses": total_losses,
-                    "win_rate": overall_win_rate
-                },
-                "orders": all_orders,
-                "recent_trades": recent_trades,
-                "strategies": strat_list
-            }
-        except Exception as e:
-            return {
-                "status": "online",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "kpi": {"total_capital": 290000.0, "total_wins": 0, "total_losses": 0, "win_rate": 0.0},
-                "orders": [],
-                "recent_trades": [],
-                "strategies": [{"name": s, "wins": 0, "losses": 0, "win_rate": 0.0, "allocated": 10000.0, "cash": 10000.0} for s in STRATEGY_ROSTER]
-            }
+                return {
+                    "status": "online",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "kpi": {
+                        "total_capital": round(dynamic_equity, 2),
+                        "total_wins": total_wins,
+                        "total_losses": total_losses,
+                        "win_rate": overall_win_rate
+                    },
+                    "orders": all_orders,
+                    "recent_trades": recent_trades,
+                    "strategies": strat_list
+                }
+            except Exception as e:
+                return {
+                    "status": "online",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "kpi": {"total_capital": 290000.0, "total_wins": 0, "total_losses": 0, "win_rate": 0.0},
+                    "orders": [],
+                    "recent_trades": [],
+                    "strategies": [{"name": s, "wins": 0, "losses": 0, "win_rate": 0.0, "allocated": 10000.0, "cash": 10000.0} for s in STRATEGY_ROSTER]
+                }
 
 # =====================================================================
-# Web API & Webhook Server
+# Web API Server
 # =====================================================================
 
 ENGINE_INSTANCE = None
@@ -532,8 +596,9 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
 
             elif parsed_path == "/api/backup":
                 if os.path.exists(HISTORY_PATH):
-                    with open(HISTORY_PATH, "rb") as f:
-                        data = f.read()
+                    with CSV_LOCK:
+                        with open(HISTORY_PATH, "rb") as f:
+                            data = f.read()
                     self.send_response(200)
                     self.send_header("Content-type", "text/csv")
                     self.send_header("Content-Disposition", "attachment; filename=trade_history.csv")
@@ -542,7 +607,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(data)
                 else:
-                    self._send_json_response(404, {"status": "error", "message": "No trade history yet."})
+                    self._send_json_response(404, {"status": "error", "message": "No trade history available."})
 
             else:
                 self._send_json_response(200, {
@@ -558,7 +623,7 @@ class DashboardAPIHandler(BaseHTTPRequestHandler):
             if parsed_path == "/api/signal":
                 content_len = int(self.headers.get("Content-Length", 0))
                 if content_len == 0:
-                    self._send_json_response(400, {"status": "error", "message": "Empty signal body"})
+                    self._send_json_response(400, {"status": "error", "message": "Empty signal payload"})
                     return
 
                 post_data = self.rfile.read(content_len)
@@ -586,7 +651,7 @@ def start_server(port=HTTP_PORT):
     server = ThreadingHTTPServer(("0.0.0.0", port), DashboardAPIHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print(f"[SERVER] Listening on port {port} (GET /api/data & POST /api/signal)")
+    print(f"[SERVER] Active on port {port} (GET /api/data & POST /api/signal)")
 
 # =====================================================================
 # Execution Engine
@@ -603,23 +668,22 @@ class ExecutionEngine:
     def process_signal(self, signal_payload: dict):
         strat_name = signal_payload.get("strategy")
         if not strat_name or strat_name not in STRATEGY_ROSTER:
-            return False, f"Unknown or missing strategy '{strat_name}'"
+            return False, f"Unknown or invalid strategy '{strat_name}'"
 
         action_ticker = signal_payload.get("action_ticker")
         if not action_ticker:
-            return False, "Missing 'action_ticker'"
+            return False, "Missing required parameter 'action_ticker'"
 
         signal_time = signal_payload.get("signal_time", datetime.now(timezone.utc).isoformat())
         action_market = signal_payload.get("action_market", "NYSE")
-        
+
         entry_window_open = is_market_open(action_market, for_entry=True)
         order_status = "ACTIVE" if entry_window_open else "PENDING_MARKET_OPEN"
         action_time = datetime.now(timezone.utc).isoformat() if entry_window_open else None
 
         raw_entry = float(signal_payload.get("entry_price", 100.0))
         direction = signal_payload.get("direction", "BUY").upper()
-        
-        # Slippage Buffer
+
         if direction in ["BUY", "LONG"]:
             entry_price = round(raw_entry * (1.0 + SLIPPAGE_PCT), 2)
         else:
@@ -631,37 +695,44 @@ class ExecutionEngine:
         qty = int(signal_payload.get("qty", 100))
 
         required_capital = round(qty * entry_price, 2)
-        strat_dict = self.portfolio_mgr.data["strategies"].setdefault(
-            strat_name, {"allocated": 10000.0, "cash": 10000.0, "positions": []}
-        )
-        available_cash = strat_dict.get("cash", 10000.0)
 
-        if available_cash < required_capital:
-            return False, f"Insufficient cash: Required ${required_capital:.2f}, Available ${available_cash:.2f}"
+        with self.portfolio_mgr.lock:
+            strat_dict = self.portfolio_mgr.data["strategies"].setdefault(
+                strat_name, {"allocated": 10000.0, "cash": 10000.0, "positions": []}
+            )
+            available_cash = strat_dict.get("cash", 10000.0)
 
-        strat_dict["cash"] = round(available_cash - required_capital, 2)
-        tp, sl = calculate_dynamic_tp_sl(entry_price, discrepancy, beta, atr_14, direction)
+            if available_cash < required_capital:
+                return False, f"Insufficient strategy cash: Required ${required_capital:.2f}, Available ${available_cash:.2f}"
 
-        position_record = {
-            "order_id": f"ORD_{int(time.time()*1000)}",
-            "status": order_status,
-            "strategy": strat_name,
-            "signal_ticker": signal_payload.get("signal_ticker", "-"),
-            "signal_market": signal_payload.get("signal_market", "-"),
-            "action_ticker": action_ticker,
-            "action_market": action_market,
-            "direction": direction,
-            "qty": qty,
-            "entry_price": entry_price,
-            "invested_capital": required_capital,
-            "tp_price": tp,
-            "sl_price": sl,
-            "signal_time": signal_time,
-            "action_time": action_time
-        }
+            strat_dict["cash"] = round(available_cash - required_capital, 2)
+            tp, sl = calculate_dynamic_tp_sl(entry_price, discrepancy, beta, atr_14, direction)
 
-        strat_dict["positions"].append(position_record)
-        self.portfolio_mgr.save()
+            position_record = {
+                "order_id": f"ORD_{int(time.time()*1000)}",
+                "status": order_status,
+                "strategy": strat_name,
+                "signal_ticker": signal_payload.get("signal_ticker", "-"),
+                "signal_market": signal_payload.get("signal_market", "-"),
+                "action_ticker": action_ticker,
+                "action_market": action_market,
+                "direction": direction,
+                "qty": qty,
+                "entry_price": entry_price,
+                "invested_capital": required_capital,
+                "discrepancy_pct": discrepancy,
+                "beta": beta,
+                "atr_14": atr_14,
+                "tp_price": tp,
+                "sl_price": sl,
+                "signal_time": signal_time,
+                "action_time": action_time
+            }
+
+            strat_dict["positions"].append(position_record)
+            self.portfolio_mgr._save_unlocked()
+
+        GITHUB_WORKER.enqueue_sync(PORTFOLIO_PATH, f"Order placed: {position_record['order_id']}")
         return True, f"Order {position_record['order_id']} placed ({order_status})"
 
     def process_pending_queues(self):
@@ -677,20 +748,20 @@ class ExecutionEngine:
 
                     if pos.get("status") == "PENDING_MARKET_OPEN":
                         action_mkt = pos.get("action_market", "NYSE")
-                        
+
                         if is_market_open(action_mkt, for_entry=True):
                             ticker = pos.get("action_ticker")
                             direction = pos.get("direction", "BUY").upper()
                             ohlc = fetch_intraday_ohlc(ticker)
-                            
+
                             if ohlc and ohlc["open"] > 0:
-                                current_945_price = ohlc["open"]
-                                old_entry = pos.get("entry_price", current_945_price)
-                                
+                                current_open_price = ohlc["open"]
+                                old_entry = pos.get("entry_price", current_open_price)
+
                                 is_trap = False
-                                if direction in ["BUY", "LONG"] and current_945_price < old_entry * 0.985:
+                                if direction in ["BUY", "LONG"] and current_open_price < old_entry * 0.985:
                                     is_trap = True
-                                elif direction in ["SELL", "SHORT"] and current_945_price > old_entry * 1.015:
+                                elif direction in ["SELL", "SHORT"] and current_open_price > old_entry * 1.015:
                                     is_trap = True
 
                                 if is_trap:
@@ -700,9 +771,9 @@ class ExecutionEngine:
                                     continue
 
                                 if direction in ["BUY", "LONG"]:
-                                    executed_price = round(current_945_price * (1.0 + SLIPPAGE_PCT), 2)
+                                    executed_price = round(current_open_price * (1.0 + SLIPPAGE_PCT), 2)
                                 else:
-                                    executed_price = round(current_945_price * (1.0 - SLIPPAGE_PCT), 2)
+                                    executed_price = round(current_open_price * (1.0 - SLIPPAGE_PCT), 2)
 
                                 old_cost = pos.get("invested_capital", old_entry * pos["qty"])
                                 new_cost = round(executed_price * pos["qty"], 2)
@@ -712,19 +783,25 @@ class ExecutionEngine:
                                 pos["entry_price"] = executed_price
                                 pos["invested_capital"] = new_cost
 
-                                tp, sl = calculate_dynamic_tp_sl(executed_price, 1.5, 1.0, 0.50, direction)
+                                disc = pos.get("discrepancy_pct", 1.5)
+                                beta = pos.get("beta", 1.0)
+                                atr = pos.get("atr_14", 0.50)
+                                tp, sl = calculate_dynamic_tp_sl(executed_price, disc, beta, atr, direction)
                                 pos["tp_price"] = tp
                                 pos["sl_price"] = sl
 
-                            pos["status"] = "ACTIVE"
-                            pos["action_time"] = datetime.now(timezone.utc).isoformat()
-                            updated = True
+                                pos["status"] = "ACTIVE"
+                                pos["action_time"] = datetime.now(timezone.utc).isoformat()
+                                updated = True
 
                     remaining_positions.append(pos)
                 strat_info["positions"] = remaining_positions
 
+            if updated:
+                self.portfolio_mgr._save_unlocked()
+
         if updated:
-            self.portfolio_mgr.save()
+            GITHUB_WORKER.enqueue_sync(PORTFOLIO_PATH, "Activated pending market orders")
 
     def check_active_positions_tp_sl(self):
         positions_to_close = []
@@ -738,7 +815,7 @@ class ExecutionEngine:
                         continue
                     if pos.get("status") == "ACTIVE":
                         action_mkt = pos.get("action_market", "NYSE")
-                        
+
                         if not is_market_open(action_mkt, for_entry=False):
                             continue
 
@@ -746,42 +823,39 @@ class ExecutionEngine:
                         if not ticker:
                             continue
 
-                        ohlc = fetch_intraday_ohlc(ticker)
-                        if not ohlc:
+                        live_price = fetch_live_price(ticker)
+                        if live_price is None or live_price <= 0:
                             continue
-
-                        bar_high = ohlc["high"]
-                        bar_low = ohlc["low"]
 
                         direction = pos.get("direction", "BUY").upper()
                         tp = pos.get("tp_price", 999999)
                         sl = pos.get("sl_price", 0)
 
                         if direction in ["BUY", "LONG"]:
-                            if bar_low <= sl:
-                                exit_price = round(min(sl, bar_low) * (1.0 - SLIPPAGE_PCT), 2)
+                            if live_price <= sl:
+                                exit_price = round(live_price * (1.0 - SLIPPAGE_PCT), 2)
                                 positions_to_close.append((strat_name, ticker, exit_price, "STOP_LOSS"))
-                            elif bar_high >= tp:
-                                exit_price = round(max(tp, bar_high) * (1.0 - SLIPPAGE_PCT), 2)
+                            elif live_price >= tp:
+                                exit_price = round(live_price * (1.0 - SLIPPAGE_PCT), 2)
                                 positions_to_close.append((strat_name, ticker, exit_price, "TAKE_PROFIT"))
                         else:
-                            if bar_high >= sl:
-                                exit_price = round(max(sl, bar_high) * (1.0 + SLIPPAGE_PCT), 2)
+                            if live_price >= sl:
+                                exit_price = round(live_price * (1.0 + SLIPPAGE_PCT), 2)
                                 positions_to_close.append((strat_name, ticker, exit_price, "STOP_LOSS"))
-                            elif bar_low <= tp:
-                                exit_price = round(min(tp, bar_low) * (1.0 + SLIPPAGE_PCT), 2)
+                            elif live_price <= tp:
+                                exit_price = round(live_price * (1.0 + SLIPPAGE_PCT), 2)
                                 positions_to_close.append((strat_name, ticker, exit_price, "TAKE_PROFIT"))
 
         for strat_name, ticker, exit_price, reason in positions_to_close:
             self.close_position(strat_name, ticker, exit_price, reason)
 
     def close_position(self, strat_name: str, action_ticker: str, exit_price: float, reason: str = "TAKE_PROFIT"):
-        strat_info = self.portfolio_mgr.data["strategies"].get(strat_name)
-        if not strat_info:
-            return
-
-        remaining = []
         with self.portfolio_mgr.lock:
+            strat_info = self.portfolio_mgr.data["strategies"].get(strat_name)
+            if not strat_info:
+                return
+
+            remaining = []
             for pos in strat_info.get("positions", []):
                 ticker = pos.get("action_ticker") or pos.get("ticker")
                 if ticker == action_ticker and pos.get("status") == "ACTIVE":
@@ -797,54 +871,46 @@ class ExecutionEngine:
                     invested = pos.get("invested_capital", round(qty * entry_price, 2))
                     returned_total = round(invested + net_pnl, 2)
                     strat_info["cash"] = round(strat_info.get("cash", 0.0) + returned_total, 2)
-                    
+
                     sig_time = pos.get("signal_time") or pos.get("entry_time")
                     act_time = pos.get("action_time")
                     ttt_str = format_trigger_time(sig_time, act_time)
 
-                    with open(HISTORY_PATH, "a", newline="") as f:
-                        writer = csv.writer(f)
-                        writer.writerow([
-                            datetime.now(timezone.utc).isoformat(),
-                            strat_name,
-                            pos.get("signal_ticker", "-"),
-                            ticker,
-                            f"CLOSE_{direction}",
-                            qty,
-                            exit_price,
-                            gross_pnl,
-                            fee,
-                            net_pnl,
-                            ttt_str,
-                            reason
-                        ])
+                    with CSV_LOCK:
+                        with open(HISTORY_PATH, "a", newline="") as f:
+                            writer = csv.writer(f)
+                            writer.writerow([
+                                datetime.now(timezone.utc).isoformat(),
+                                strat_name,
+                                pos.get("signal_ticker", "-"),
+                                ticker,
+                                f"CLOSE_{direction}",
+                                qty,
+                                exit_price,
+                                gross_pnl,
+                                fee,
+                                net_pnl,
+                                ttt_str,
+                                reason
+                            ])
 
-                    print(f"🎯 [TRADE CLOSED] {strat_name} ({direction} {ticker}) at ${exit_price} | Net PnL: ${net_pnl}")
+                    print(f"🎯 [TRADE CLOSED] {strat_name} ({direction} {ticker}) at ${exit_price} | Net PnL:${net_pnl}")
                 else:
                     remaining.append(pos)
 
             strat_info["positions"] = remaining
-        self.portfolio_mgr.save()
+            self.portfolio_mgr._save_unlocked()
 
-        if GITHUB_REPO and GITHUB_TOKEN:
-            threading.Thread(
-                target=sync_file_to_github,
-                args=(HISTORY_PATH, GITHUB_REPO, GITHUB_TOKEN, f"Auto-sync: closed {action_ticker} ({reason})"),
-                daemon=True
-            ).start()
-            threading.Thread(
-                target=sync_file_to_github,
-                args=(PORTFOLIO_PATH, GITHUB_REPO, GITHUB_TOKEN, f"Auto-sync: portfolio after {action_ticker}"),
-                daemon=True
-            ).start()
+        GITHUB_WORKER.enqueue_sync(HISTORY_PATH, f"Closed {action_ticker} ({reason})")
+        GITHUB_WORKER.enqueue_sync(PORTFOLIO_PATH, f"Portfolio update after closing {action_ticker}")
 
 # =====================================================================
-# Main Loop
+# Main Execution Loop
 # =====================================================================
 
 if __name__ == "__main__":
     engine = ExecutionEngine()
-    print("🚀 LagTrader Engine Running (29 Models). TwelveData Key Rotation & GitHub CSV Sync Active.")
+    print("🚀 LagTrader Engine Running (29 Models). Sequential GitHub Persistence & Thread-Safe Core Active.")
 
     while True:
         try:
